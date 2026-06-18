@@ -1,0 +1,59 @@
+# Codex CLI config — points to local mimo2codex proxy
+# Copy to ~/.codex/config.toml
+
+#:schema https://developers.openai.com/codex/config-schema.json
+
+model = "deepseek-v4-flash-free"
+model_provider = "zen-proxy"
+model_reasoning_effort = "xhigh"
+model_context_window = 1000000
+model_max_output = 8192
+service_tier = "default"
+
+approval_policy = "never"
+approvals_reviewer = "user"
+sandbox_mode = "danger-full-access"
+
+web_search = "live"
+
+[notice]
+hide_full_access_warning = true
+
+[model_providers.zen-proxy]
+name = "OpenCode ZEN (via mimo2codex proxy)"
+base_url = "http://127.0.0.1:8788/v1"
+env_key = "OPENAI_API_KEY"
+wire_api = "responses"
+requires_openai_auth = false
+supports_websockets = false
+stream_idle_timeout_ms = 600000
+
+[model_properties."deepseek-v4-flash-free"]
+context_window = 1000000
+max_context_window = 1000000
+max_output = 8192
+supports_parallel_tool_calls = true
+supports_reasoning_summaries = true
+input_modalities = ["text"]
+
+[features]
+terminal_resize_reflow = true
+memories = true
+goals = true
+prevent_idle_sleep = true
+network_proxy = true
+multi_agent = true
+
+[profiles.strict]
+approval_policy = "on-request"
+sandbox_mode = "read-only"
+web_search = "cached"
+
+[profiles.yolo]
+approval_policy = "never"
+sandbox_mode = "workspace-write"
+web_search = "live"
+
+[agents]
+max_threads = 6
+max_depth = 1

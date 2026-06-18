@@ -62,7 +62,7 @@ bash start.sh status
 | **Tor SOCKS5 #2** | `9060` | Proxy 2 — independent circuit |
 | **Tor Control** | `9051` | NEWNYM signal for IP rotation |
 | **Claude Proxy** | `4013` | Anthropic API → OpenAI API translation |
-| **MiMo Proxy** | `8788` | OpenAI responses API for Codex CLI |
+| **MiMo2Codex** | `8788` | `npm install -g mimo2codex` → OpenAI proxy for Codex CLI |
 | **IP Rotator** | — | Auto-rotates exit nodes every 10 min |
 
 ## Components Deep Dive
@@ -119,14 +119,27 @@ BIG_MODEL=deepseek-v4-flash-free
 CLAUDE_PROXY_PORT=4013
 ```
 
-### 🎯 Codex/MiMo Proxy
+### 🎯 MiMo2Codex Proxy (Codex CLI)
 
-Node.js proxy that converts OpenAI Responses API format to MiMo chat completions format. Used by Codex CLI.
+Global npm package (`mimo2codex`) that provides an OpenAI-compatible Responses API proxy on port 8788. Codex CLI connects to this.
 
-**Config in** `codex-proxy/config.toml`:
-```toml
-[model_providers.zen-proxy]
-base_url = "http://127.0.0.1:8788/v1"
+**Install:**
+```bash
+npm install -g mimo2codex
+```
+
+**Configure** `~/.mimo2codex/.env`:
+```bash
+GENERIC_BASE_URL=https://opencode.ai/zen/v1
+GENERIC_API_KEY=sk-you-api-key-here
+GENERIC_DEFAULT_MODEL=deepseek-v4-flash-free
+MIMO2CODEX_DEFAULT_PROVIDER=generic
+MIMO2CODEX_PORT=8788
+```
+
+**Start:**
+```bash
+mimo2codex --model generic
 ```
 
 ## Commands
@@ -156,15 +169,19 @@ Add to `~/.claude/settings.json`:
 
 ### Codex CLI
 
+Install `mimo2codex` globally, configure `~/.mimo2codex/.env`, then:
+
+```bash
+mimo2codex --model generic
+```
+
 Add to `~/.codex/config.toml`:
 ```toml
 model = "deepseek-v4-flash-free"
 model_provider = "zen-proxy"
 
 [model_providers.zen-proxy]
-name = "OpenCode ZEN"
 base_url = "http://127.0.0.1:8788/v1"
-env_key = "OPENAI_API_KEY"
 wire_api = "responses"
 ```
 
@@ -217,9 +234,10 @@ tor-proxy-toolkit/
 │   ├── start_proxy.py
 │   ├── requirements.txt
 │   └── pyproject.toml
-├── codex-proxy/                # MiMo/OpenAI proxy for Codex
-│   ├── config.toml
-│   └── mimo-proxy-server.mjs
+├── mimo2codex/                 # Codex CLI proxy config
+│   ├── .env.example            # Provider config template
+│   ├── config.toml.example     # Codex CLI config template
+│   └── README.md               # Setup instructions
 └── docs/
     └── setup.md
 ```

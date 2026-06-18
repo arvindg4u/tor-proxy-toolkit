@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================
 # tor-proxy-toolkit — Master Start Script
-# Starts: Tor + Claude Proxy + Codex Proxy + IP Rotator
+# Starts: Tor + Claude Proxy + mimo2codex + IP Rotator
 # ============================================
 set -e
 
@@ -35,7 +35,7 @@ fi
 TOR_SOCKS_PORT1="${TOR_SOCKS_PORT1:-9050}"
 TOR_SOCKS_PORT2="${TOR_SOCKS_PORT2:-9060}"
 TOR_CONTROL_PORT="${TOR_CONTROL_PORT:-9051}"
-TOR_CONTROL_PASSWORD="${TOR_CONTROL_PASSWORD:-your-tor-control-password}"
+TOR_CONTROL_PASSWORD="${TOR_…ord:-chintu_tor_2026}"
 CLAUDE_PROXY_PORT="${CLAUDE_PROXY_PORT:-4013}"
 MIMO_PROXY_PORT="${MIMO_PROXY_PORT:-8788}"
 ROTATE_INTERVAL="${ROTATE_INTERVAL:-600}"
@@ -43,7 +43,7 @@ ROTATE_INTERVAL="${ROTATE_INTERVAL:-600}"
 # ── Check dependencies ──
 check_deps() {
     local missing=0
-    for cmd in tor python3 node curl; do
+    for cmd in tor python3 curl; do
         if ! command -v $cmd &>/dev/null; then
             err "Missing: $cmd"
             missing=1
@@ -97,7 +97,7 @@ start_claude_proxy() {
 
     info "Starting Claude Code Proxy on port $CLAUDE_PROXY_PORT..."
     cd "$SCRIPT_DIR/claude-code-proxy"
-    
+
     export OPENAI_API_KEY="${OPENAI_API_KEY:-sk-dummy}"
     export OPENAI_BASE_URL="${OPENAI_BASE_URL:-https://opencode.ai/zen/v1}"
     export BIG_MODEL="${BIG_MODEL:-deepseek-v4-flash-free}"
@@ -114,22 +114,32 @@ start_claude_proxy() {
     cd "$SCRIPT_DIR"
 }
 
-# ── Start MiMo/Codex Proxy ──
+# ── Start mimo2codex Proxy (Codex CLI) ──
 start_codex_proxy() {
     if [ -f "$PID_DIR/codex-proxy.pid" ] && kill -0 "$(cat $PID_DIR/codex-proxy.pid)" 2>/dev/null; then
-        warn "Codex proxy already running (PID: $(cat $PID_DIR/codex-proxy.pid))"
+        warn "mimo2codex already running (PID: $(cat $PID_DIR/codex-proxy.pid))"
         return
     fi
 
-    info "Starting MiMo/Codex Proxy on port $MIMO_PROXY_PORT..."
-    cd "$SCRIPT_DIR/codex-proxy"
-    
-    export MIMO_API_KEY="${MIMO_API_KEY:-sk-dummy}"
-    
-    node mimo-proxy-server.mjs > "$LOG_DIR/codex-proxy.log" 2>&1 &
+    info "Starting mimo2codex Proxy on port $MIMO_PROXY_PORT..."
+
+    # Check if mimo2codex is installed
+    if ! command -v mimo2codex &>/dev/null; then
+        warn "mimo2codex not found. Installing..."
+        npm install -g mimo2codex 2>/dev/null || { err "Failed to install mimo2codex"; return; }
+    fi
+
+    # Check if .env exists
+    if [ ! -f ~/.mimo2codex/.env ]; then
+        warn "No ~/.mimo2codex/.env found — copying template"
+        mkdir -p ~/.mimo2codex
+        cp "$SCRIPT_DIR/mimo2codex/.env.example" ~/.mimo2codex/.env
+        warn "⚠️  Edit ~/.mimo2codex/.env with your API key before starting!"
+    fi
+
+    mimo2codex --model generic --host 127.0.0.1 --port $MIMO_PROXY_PORT > "$LOG_DIR/codex-proxy.log" 2>&1 &
     echo $! > "$PID_DIR/codex-proxy.pid"
-    log "Codex proxy started (PID: $!)"
-    cd "$SCRIPT_DIR"
+    log "mimo2codex started (PID: $!)"
 }
 
 # ── Start IP Rotator ──
@@ -140,11 +150,11 @@ start_rotator() {
     fi
 
     info "Starting IP Rotator (every ${ROTATE_INTERVAL}s)..."
-    
-    # Update password in rotate script
-    sed "s/TOR_PASSWORD = .*/TOR_PASSWORD = \"$TOR_CONTROL_PASSWORD\"/" \
+
+    # Create temp script with correct password
+    sed "s/TOR_PASSWORD = .*$/TOR_PASSWORD = \"$TOR_CONTROL_PASSWORD\"/" \
         "$SCRIPT_DIR/tor/tor_rotate.py" > /tmp/tor_rotate_active.py
-    
+
     python3 /tmp/tor_rotate_active.py > "$LOG_DIR/rotator.log" 2>&1 &
     echo $! > "$PID_DIR/rotator.pid"
     log "IP rotator started (PID: $!)"
@@ -154,9 +164,9 @@ start_rotator() {
 show_status() {
     echo ""
     echo -e "${CYAN}═══════════════════════════════════════════${NC}"
-    echo -e "${CYAN}  Tor Proxy Toolkit — Status${NC}"
+    echo -e "${CYAN}  🧅 Tor Proxy Toolkit — Status${NC}"
     echo -e "${CYAN}═══════════════════════════════════════════${NC}"
-    
+
     for svc in tor claude-proxy codex-proxy rotator; do
         pidfile="$PID_DIR/$svc.pid"
         if [ -f "$pidfile" ] && kill -0 "$(cat $pidfile)" 2>/dev/null; then
@@ -165,7 +175,7 @@ show_status() {
             echo -e "  ${RED}●${NC} $svc: stopped"
         fi
     done
-    
+
     echo ""
     echo "  Ports:"
     for port in $TOR_SOCKS_PORT1 $TOR_SOCKS_PORT2 $TOR_CONTROL_PORT $CLAUDE_PROXY_PORT $MIMO_PROXY_PORT; do
@@ -175,13 +185,13 @@ show_status() {
             echo -e "    ${RED}✗${NC} $port — not listening"
         fi
     done
-    
+
     echo ""
     echo "  Proxy URLs:"
     echo "    SOCKS5 (port 1): socks5://127.0.0.1:$TOR_SOCKS_PORT1"
     echo "    SOCKS5 (port 2): socks5://127.0.0.1:$TOR_SOCKS_PORT2"
     echo "    Claude Code:     http://127.0.0.1:$CLAUDE_PROXY_PORT"
-    echo "    Codex/MiMo:      http://127.0.0.1:$MIMO_PROXY_PORT"
+    echo "    Codex/mimo2codex: http://127.0.0.1:$MIMO_PROXY_PORT"
     echo -e "${CYAN}═══════════════════════════════════════════${NC}"
 }
 
