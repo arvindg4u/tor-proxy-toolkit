@@ -1,0 +1,26 @@
+## ============================================
+## Tor Config — Dual SOCKS5 Proxy + Auto Rotate
+## Arvind's setup — 2026-06-18
+## ============================================
+
+## === SOCKS5 PROXY PORTS ===
+## Port 1: Translator Proxy 1
+SocksPort 127.0.0.1:9050 IsolateDestAddr IsolateDestPort
+
+## Port 2: Translator Proxy 2
+SocksPort 127.0.0.1:9060 IsolateDestAddr IsolateDestPort
+
+## === CONTROL PORT (for NEWNYM IP rotation) ===
+ControlPort 9051
+HashedControlPassword 16:REPLACE_WITH_YOUR_HASHED_PASSWORD
+
+## === DNS THROUGH TOR (prevent leaks) ===
+DNSPort 5353
+AutomapHostsOnResolve 1
+
+## === CIRCUIT SETTINGS ===
+NewCircuitPeriod 600
+MaxCircuitDirtiness 600
+
+## === LOGGING ===
+Log notice file /var/log/tor/notices.log

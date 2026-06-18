@@ -1,0 +1,92 @@
+#:schema https://developers.openai.com/codex/config-schema.json
+
+# ── Model selection (DeepSeek V4 Flash Free via mimo2codex proxy) ──
+model = "deepseek-v4-flash-free"
+model_provider = "zen-proxy"
+model_reasoning_effort = "xhigh"
+model_context_window = 1000000
+model_max_output = 8192
+service_tier = "default"
+
+# ── Approval & sandbox ──
+approval_policy = "never"
+approvals_reviewer = "user"
+sandbox_mode = "danger-full-access"
+
+# ── Runtime settings ──
+web_search = "live"
+persistent_instructions = "Follow project AGENTS.md guidelines. Use available MCP servers when they can help."
+
+# ── Notice ──
+[notice]
+hide_full_access_warning = true
+[notice.model_migrations]
+"deepseek-v4-flash-free" = "deepseek-v4-flash-free"
+
+# ── Model provider (mimo2codex → opencode.ai) ──
+[model_providers.zen-proxy]
+name = "OpenCode ZEN (via proxy)"
+base_url = "http://127.0.0.1:8788/v1"
+env_key = "OPENAI_API_KEY"
+wire_api = "responses"
+requires_openai_auth = false
+supports_websockets = false
+stream_idle_timeout_ms = 600000
+
+# ── Model properties ──
+[model_properties."deepseek-v4-flash-free"]
+context_window = 1000000
+max_context_window = 1000000
+max_output = 8192
+supports_parallel_tool_calls = true
+supports_reasoning_summaries = true
+input_modalities = ["text"]
+
+# ── Features ──
+[features]
+terminal_resize_reflow = true
+memories = true
+external_migration = true
+goals = true
+prevent_idle_sleep = true
+network_proxy = true
+multi_agent = true
+
+# ── MCP Servers ──
+# Uncomment and configure as needed. Replace YOUR_* placeholders.
+
+# [mcp_servers.web-search]
+# url = "https://your-web-search-mcp-url/mcp"
+
+# [mcp_servers.github]
+# url = "https://api.githubcopilot.com/mcp/"
+# [mcp_servers.github.http_headers]
+# Authorization = "Bearer ghp_YOUR_GITHUB_TOKEN"
+
+# [mcp_servers.context7]
+# command = "npx"
+# args = ["-y", "@upstash/context7-mcp"]
+# [mcp_servers.context7.env]
+# CONTEXT7_API_KEY = "ctx7sk_YOUR_KEY"
+
+# [mcp_servers.youtube]
+# command = "node"
+# args = ["/usr/lib/node_modules/@kirbah/mcp-youtube/dist/index.js"]
+# [mcp_servers.youtube.env]
+# YOUTUBE_API_KEY = "YOUR_YOUTUBE_API_KEY"
+
+# ── Profiles ──
+[profiles.strict]
+approval_policy = "on-request"
+sandbox_mode = "read-only"
+web_search = "cached"
+
+[profiles.yolo]
+approval_policy = "never"
+sandbox_mode = "workspace-write"
+web_search = "live"
+
+# ── Agents ──
+[agents]
+max_threads = 6
+max_depth = 1
