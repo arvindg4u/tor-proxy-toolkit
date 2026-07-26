@@ -4,8 +4,13 @@ PID_DIR="/tmp/tor-toolkit-pids"
 LOG_DIR="${HOME}/.claude/zen-logs"
 
 case "${1:-status}" in
-    start|restart)
-        $0 stop 2>/dev/null
+    restart)
+        if [ -f "$PID_DIR/claude-proxy.pid" ] && kill -0 "$(cat $PID_DIR/claude-proxy.pid)" 2>/dev/null; then
+            $0 stop 2>/dev/null
+        fi
+        $0 start
+        ;;
+    start)
         cd "$SCRIPT_DIR/claude-code-proxy"
         export OPENAI_API_KEY="$(grep '^OPENAI_API_KEY=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2-)"
         export OPENAI_BASE_URL="$(grep '^OPENAI_BASE_URL=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2-)"
