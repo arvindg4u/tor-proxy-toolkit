@@ -106,7 +106,7 @@ start_claude_proxy() {
     export ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
     export PORT="$CLAUDE_PROXY_PORT"
     export LOG_LEVEL="WARNING"
-    export MAX_TOKENS_LIMIT="65536"
+    export MAX_TOKENS_LIMIT="128000"
 
     python3 start_proxy.py > "$LOG_DIR/claude-proxy.log" 2>&1 &
     echo $! > "$PID_DIR/claude-proxy.pid"
