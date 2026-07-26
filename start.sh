@@ -252,8 +252,15 @@ case "${1:-start}" in
     restart)  stop_all; sleep 2; $0 start ;;
     status)   show_status ;;
     rotate)   manual_rotate ;;
+    proxy)    start_claude_proxy ;;
+    stop-proxy)
+        pidfile="$PID_DIR/claude-proxy.pid"
+        if [ -f "$pidfile" ]; then kill "$(cat $pidfile)" 2>/dev/null && log "Stopped claude proxy" || warn "Claude proxy not running"; rm -f "$pidfile"; fi
+        pkill -f "start_proxy.py" 2>/dev/null || true
+        ;;
+    restart-proxy) $0 stop-proxy; sleep 1; $0 proxy ;;
     *)
-        echo "Usage: $0 {start|stop|restart|status|rotate}"
+        echo "Usage: $0 {start|stop|restart|status|rotate|proxy|stop-proxy|restart-proxy}"
         exit 1
         ;;
 esac
