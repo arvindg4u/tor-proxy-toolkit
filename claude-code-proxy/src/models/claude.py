@@ -34,7 +34,8 @@ class ClaudeTool(BaseModel):
     input_schema: Dict[str, Any]
 
 class ClaudeThinkingConfig(BaseModel):
-    enabled: bool = True
+    type: str = "enabled"
+    budget_tokens: Optional[int] = None
 
 class ClaudeMessagesRequest(BaseModel):
     model: str

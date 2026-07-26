@@ -111,6 +111,15 @@ def convert_claude_to_openai(
     if claude_request.top_p is not None:
         openai_request["top_p"] = claude_request.top_p
 
+    # Map Claude thinking config to DeepSeek reasoning effort
+    if claude_request.thinking and claude_request.thinking.type == "enabled":
+        budget = claude_request.thinking.budget_tokens or 0
+        if budget >= 8192:
+            openai_request["reasoning_effort"] = "max"
+        else:
+            openai_request["reasoning_effort"] = "high"
+        openai_request["extra_body"] = {"thinking": {"type": "enabled"}}
+
     # Convert tools
     if claude_request.tools:
         openai_tools = []
