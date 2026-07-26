@@ -1,0 +1,51 @@
+#!/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+PID_DIR="/tmp/tor-toolkit-pids"
+LOG_DIR="${HOME}/.claude/zen-logs"
+
+case "${1:-status}" in
+    start|restart)
+        $0 stop 2>/dev/null
+        cd "$SCRIPT_DIR/claude-code-proxy"
+        export OPENAI_API_KEY="$(grep '^OPENAI_API_KEY=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2-)"
+        export OPENAI_BASE_URL="$(grep '^OPENAI_BASE_URL=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2-)"
+        export BIG_MODEL="$(grep '^BIG_MODEL=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2-)"
+        export MIDDLE_MODEL="$(grep '^MIDDLE_MODEL=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2-)"
+        export SMALL_MODEL="$(grep '^SMALL_MODEL=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2-)"
+        export PORT=4013
+        export LOG_LEVEL="WARNING"
+        export MAX_TOKENS_LIMIT="128000"
+        mkdir -p "$LOG_DIR" "$PID_DIR"
+        python3 start_proxy.py > "$LOG_DIR/claude-proxy.log" 2>&1 &
+        echo $! > "$PID_DIR/claude-proxy.pid"
+        sleep 2
+        if kill -0 "$(cat $PID_DIR/claude-proxy.pid)" 2>/dev/null; then
+            echo "[✓] Claude Zen proxy started (PID: $(cat $PID_DIR/claude-proxy.pid))"
+        else
+            echo "[✗] Failed to start — check $LOG_DIR/claude-proxy.log"
+            tail -3 "$LOG_DIR/claude-proxy.log" 2>/dev/null
+            exit 1
+        fi
+        ;;
+    stop)
+        pidfile="$PID_DIR/claude-proxy.pid"
+        if [ -f "$pidfile" ]; then
+            kill "$(cat $pidfile)" 2>/dev/null
+            rm -f "$pidfile"
+        fi
+        pkill -f "start_proxy.py" 2>/dev/null || true
+        echo "[✓] Claude Zen proxy stopped"
+        ;;
+    status)
+        pidfile="$PID_DIR/claude-proxy.pid"
+        if [ -f "$pidfile" ] && kill -0 "$(cat $pidfile)" 2>/dev/null; then
+            echo "[✓] Claude Zen proxy is running (PID: $(cat $pidfile))"
+            curl -s http://127.0.0.1:4013/health | python3 -m json.tool 2>/dev/null
+        else
+            echo "[✗] Claude Zen proxy is not running"
+        fi
+        ;;
+    *)
+        echo "Usage: claude-zen {start|stop|restart|status}"
+        ;;
+esac
