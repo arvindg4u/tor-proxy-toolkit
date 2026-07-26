@@ -110,7 +110,13 @@ start_claude_proxy() {
 
     python3 start_proxy.py > "$LOG_DIR/claude-proxy.log" 2>&1 &
     echo $! > "$PID_DIR/claude-proxy.pid"
-    log "Claude proxy started (PID: $!)"
+    sleep 2
+    if kill -0 "$(cat $PID_DIR/claude-proxy.pid)" 2>/dev/null; then
+        log "Claude proxy started (PID: $(cat $PID_DIR/claude-proxy.pid))"
+    else
+        err "Claude proxy failed to start — check $LOG_DIR/claude-proxy.log"
+        tail -5 "$LOG_DIR/claude-proxy.log" 2>/dev/null | while read line; do err "  $line"; done
+    fi
     cd "$SCRIPT_DIR"
 }
 

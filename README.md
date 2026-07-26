@@ -242,6 +242,15 @@ tor-proxy-toolkit/
     └── setup.md
 ```
 
+## Troubleshooting
+
+Having issues? See the [Troubleshooting Guide](docs/troubleshooting.md) for common problems:
+
+- **ConnectionRefused** — Proxy not running
+- **401 Invalid API key** — Placeholder key in `.env`
+- **Empty responses** — `max_tokens` too low
+- **Proxy dies on restart** — Not configured to auto-start
+
 ## FAQ
 
 **Q: Does this cost anything?**
