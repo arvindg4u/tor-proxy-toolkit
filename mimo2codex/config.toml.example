@@ -7,7 +7,7 @@ model = "deepseek-v4-flash-free"
 model_provider = "zen-proxy"
 model_reasoning_effort = "xhigh"
 model_context_window = 1000000
-model_max_output = 8192
+model_max_output = 128000
 service_tier = "default"
 
 # Model metadata catalog so Codex trusts the 1M context window
