@@ -10,6 +10,11 @@ model_context_window = 1000000
 model_max_output = 8192
 service_tier = "default"
 
+# Model metadata catalog so Codex trusts the 1M context window
+# (without it, Codex falls back to ~258K and compacts too early).
+# Copy catalog.json next to this config: cp mimo2codex/catalog.json ~/.codex/catalog.json
+model_catalog_json = "~/.codex/catalog.json"
+
 approval_policy = "never"
 approvals_reviewer = "user"
 sandbox_mode = "danger-full-access"
@@ -28,13 +33,8 @@ requires_openai_auth = false
 supports_websockets = false
 stream_idle_timeout_ms = 600000
 
-[model_properties."deepseek-v4-flash-free"]
-context_window = 1000000
-max_context_window = 1000000
-max_output = 8192
-supports_parallel_tool_calls = true
-supports_reasoning_summaries = true
-input_modalities = ["text"]
+# NOTE: per-model metadata lives in catalog.json (via model_catalog_json above),
+# not in a [model_properties.*] table. Codex 0.146+ ignores the latter.
 
 [features]
 terminal_resize_reflow = true

@@ -37,6 +37,26 @@ env_key = "OPENAI_API_KEY"
 wire_api = "responses"
 ```
 
+### 1M context window (important)
+
+Without metadata, Codex falls back to a conservative ~258K window and compacts
+too early — the upstream really does accept 1M tokens, but Codex won't use it.
+Fix it with a model catalog:
+
+```bash
+cp mimo2codex/catalog.json ~/.codex/catalog.json
+```
+
+and add this line to `~/.codex/config.toml`:
+```toml
+model_catalog_json = "~/.codex/catalog.json"
+```
+
+Verify with:
+```bash
+codex debug models   # deepseek-v4-flash-free should show context_window: 1000000
+```
+
 ## Using with Tor
 
 To route mimo2codex traffic through Tor:
