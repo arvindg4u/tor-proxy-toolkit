@@ -16,12 +16,53 @@ cp mimo2codex/.env.example ~/.mimo2codex/.env
 nano ~/.mimo2codex/.env  # Add your API key
 ```
 
-2. Start the proxy:
+2. Apply the User-Agent fix (REQUIRED, see below):
+```bash
+bash mimo2codex/patch-user-agent.sh
+```
+
+3. Start the proxy:
 ```bash
 mimo2codex --model generic
 ```
 
-3. The proxy runs on `http://127.0.0.1:8788` by default.
+4. The proxy runs on `http://127.0.0.1:8788` by default.
+
+### ⚠️ Fixing 429 "FreeUsageLimitError" after a few turns
+
+The zen backend (`opencode.ai/zen`) rate-limits **by User-Agent**. The stock
+mimo2codex sends `User-Agent: mimo2codex/<version>` upstream, which zen puts
+on a tiny "bot tier" — it 429s after a few turns even from a fresh IP. The
+real opencode CLI sends `User-Agent: opencode/<version>` and gets the normal
+free tier.
+
+The fix makes the proxy send the opencode CLI UA upstream:
+
+```bash
+# 1. Patch the installed package (idempotent)
+bash mimo2codex/patch-user-agent.sh
+
+# 2. Ensure ~/.mimo2codex/.env has (already present in .env.example):
+#    MIMO2CODEX_UPSTREAM_USER_AGENT=opencode/1.18.18
+
+# 3. Restart the proxy
+pkill -9 -f "pkg/dist/cli.js --model generic"
+mimo2codex --model generic
+```
+
+> **Re-apply after every restart/reinstall**: `npm i -g mimo2codex` ships the
+> unpatched `config.js`, so the patch script must be run again. On Lightning
+> Studios only `/this_studio` persists — keep the patched package + wrapper
+> there (`~/.mimo2codex/pkg/`) and start it with the local copy.
+
+Verify the fix with a direct call (expect HTTP 200, not 429):
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" \
+  http://127.0.0.1:8788/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-your-api-key" \
+  -d '{"model":"deepseek-v4-flash-free","messages":[{"role":"user","content":"hi"}],"stream":false}'
+```
 
 ## Codex CLI Integration
 
