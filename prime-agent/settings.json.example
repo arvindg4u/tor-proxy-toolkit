@@ -1,0 +1,27 @@
+{
+  "defaultProvider": "opencode",
+  "defaultModel": "deepseek-v4-flash-free",
+  "defaultThinkingLevel": "xhigh",
+  "mcpServers": {
+    "web-search": {
+      "type": "stdio",
+      "command": "/teamspace/studios/this_studio/open-webSearch/start-mcp.sh",
+      "args": [],
+      "cwd": "/teamspace/studios/this_studio/open-webSearch",
+      "env": {
+        "MODE": "stdio",
+        "DEFAULT_SEARCH_ENGINE": "duckduckgo",
+        "HOME": "/teamspace/studios/this_studio"
+      },
+      "startup_timeout_sec": 120.0
+    }
+  },
+  "terminal": {
+    "showTerminalProgress": true
+  },
+  "theme": "prime",
+  "images": {
+    "blockImages": true
+  },
+  "hideThinkingBlock": true
+}

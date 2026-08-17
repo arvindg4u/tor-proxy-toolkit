@@ -63,6 +63,7 @@ bash start.sh status
 | **Tor Control** | `9051` | NEWNYM signal for IP rotation |
 | **Claude Proxy** | `4013` | Anthropic API → OpenAI API translation |
 | **MiMo2Codex** | `8788` | `npm install -g mimo2codex` → OpenAI proxy for Codex CLI |
+| **Prime Agent** | — | `npm install -g prime-agent` → TUI agent wired to the mimo2codex proxy |
 | **IP Rotator** | — | Auto-rotates exit nodes every 10 min |
 
 ## Components Deep Dive
@@ -141,6 +142,31 @@ MIMO2CODEX_PORT=8788
 ```bash
 mimo2codex --model generic
 ```
+
+> **Requires the User-Agent fix** — see [`mimo2codex/patch-user-agent.sh`](mimo2codex/). Without it, zen treats the proxy's `mimo2codex/…` UA as bot traffic and 429s after a few turns.
+
+### 🚀 Prime Agent
+
+Terminal-first agent CLI (`prime-agent`) wired to the same `mimo2codex` proxy on port 8788 — no separate port.
+
+**Install:**
+```bash
+npm install -g prime-agent
+```
+
+**Configure** `~/.prime/agent/models.json` + `~/.prime/agent/settings.json`:
+```bash
+cp prime-agent/models.json.example ~/.prime/agent/models.json
+cp prime-agent/settings.json.example ~/.prime/agent/settings.json
+export OPENAI_API_KEY=sk-you-api-key-here
+```
+
+**Start:**
+```bash
+prime-agent
+```
+
+See [`prime-agent/README.md`](prime-agent/) for details.
 
 ## Commands
 
@@ -237,6 +263,11 @@ tor-proxy-toolkit/
 ├── mimo2codex/                 # Codex CLI proxy config
 │   ├── .env.example            # Provider config template
 │   ├── config.toml.example     # Codex CLI config template
+│   ├── patch-user-agent.sh     # 429 fix (sends opencode UA upstream)
+│   └── README.md               # Setup instructions
+├── prime-agent/                # Prime Agent CLI config
+│   ├── models.json.example     # Provider + model catalog template
+│   ├── settings.json.example   # Global settings template
 │   └── README.md               # Setup instructions
 └── docs/
     └── setup.md
