@@ -48,7 +48,7 @@ The `.env.example` and default `.env` have placeholder keys that won't work.
 curl -s -X POST https://opencode.ai/zen/v1/chat/completions \
   -H "Authorization: Bearer $(grep OPENAI_API_KEY .env | cut -d= -f2)" \
   -H "content-type: application/json" \
-  -d '{"model":"deepseek-v4-flash-free","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}'
+  -d '{"model":"x-preview-f-free","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}'
 # If 401 → key is invalid
 ```
 

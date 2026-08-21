@@ -1,9 +1,9 @@
 {
  "models": [
   {
-   "slug": "deepseek-v4-flash-free",
-   "display_name": "DeepSeek V4 Flash Free (OpenCode ZEN)",
-   "description": "Free DeepSeek V4 Flash served through the OpenCode ZEN proxy with a 1M context window.",
+   "slug": "x-preview-f-free",
+   "display_name": "X Preview F Free (OpenCode ZEN)",
+   "description": "Free x-preview-f model served through the OpenCode ZEN proxy with a 1M context window.",
    "default_reasoning_level": "xhigh",
    "supported_reasoning_levels": [
     {

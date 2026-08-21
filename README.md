@@ -116,7 +116,7 @@ Translates Anthropic Claude API format to OpenAI-compatible format, pointing to 
 **Config in** `.env`:
 ```bash
 OPENAI_BASE_URL=https://opencode.ai/zen/v1
-BIG_MODEL=deepseek-v4-flash-free
+BIG_MODEL=x-preview-f-free
 CLAUDE_PROXY_PORT=4013
 ```
 
@@ -133,7 +133,7 @@ npm install -g mimo2codex
 ```bash
 GENERIC_BASE_URL=https://opencode.ai/zen/v1
 GENERIC_API_KEY=sk-you-api-key-here
-GENERIC_DEFAULT_MODEL=deepseek-v4-flash-free
+GENERIC_DEFAULT_MODEL=x-preview-f-free
 MIMO2CODEX_DEFAULT_PROVIDER=generic
 MIMO2CODEX_PORT=8788
 ```
@@ -188,7 +188,7 @@ Add to `~/.claude/settings.json`:
   "env": {
     "ANTHROPIC_BASE_URL": "http://127.0.0.1:4013",
     "ANTHROPIC_AUTH_TOKEN": "sk-your-key",
-    "ANTHROPIC_MODEL": "deepseek-v4-flash-free"
+    "ANTHROPIC_MODEL": "x-preview-f-free"
   }
 }
 ```
@@ -203,7 +203,7 @@ mimo2codex --model generic
 
 Add to `~/.codex/config.toml`:
 ```toml
-model = "deepseek-v4-flash-free"
+model = "x-preview-f-free"
 model_provider = "zen-proxy"
 
 [model_providers.zen-proxy]

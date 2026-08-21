@@ -1,7 +1,7 @@
 # Prime Agent Proxy Setup
 
 Point the [Prime Agent](https://github.com/earendil-works/prime) CLI at the
-local `mimo2codex` proxy (which talks to OpenCode ZEN → DeepSeek V4 Flash Free).
+local `mimo2codex` proxy (which talks to OpenCode ZEN → x-preview-f-free).
 
 Prime reads custom providers from `~/.prime/agent/models.json` and global
 settings from `~/.prime/agent/settings.json`. Both are simple JSON files — no
@@ -47,7 +47,7 @@ export OPENAI_API_KEY=sk-your-api-key
 prime-agent
 ```
 
-The default provider/model is `opencode/deepseek-v4-flash-free`. Switch with
+The default provider/model is `opencode/x-preview-f-free`. Switch with
 `/model` at the prompt or check available models with:
 ```bash
 prime-agent model list

@@ -61,14 +61,14 @@ curl -s -o /dev/null -w "%{http_code}\n" \
   http://127.0.0.1:8788/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer sk-your-api-key" \
-  -d '{"model":"deepseek-v4-flash-free","messages":[{"role":"user","content":"hi"}],"stream":false}'
+  -d '{"model":"x-preview-f-free","messages":[{"role":"user","content":"hi"}],"stream":false}'
 ```
 
 ## Codex CLI Integration
 
 Add to `~/.codex/config.toml`:
 ```toml
-model = "deepseek-v4-flash-free"
+model = "x-preview-f-free"
 model_provider = "zen-proxy"
 
 [model_providers.zen-proxy]
@@ -95,7 +95,7 @@ model_catalog_json = "~/.codex/catalog.json"
 
 Verify with:
 ```bash
-codex debug models   # deepseek-v4-flash-free should show context_window: 1000000
+codex debug models   # x-preview-f-free should show context_window: 1000000
 ```
 
 ## Using with Tor

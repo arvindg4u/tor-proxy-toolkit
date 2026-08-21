@@ -6,8 +6,8 @@
       "apiKey": "OPENAI_API_KEY",
       "models": [
         {
-          "id": "deepseek-v4-flash-free",
-          "name": "DeepSeek V4 Flash Free (OpenCode ZEN via mimo2codex)",
+          "id": "x-preview-f-free",
+          "name": "X Preview F Free (OpenCode ZEN via mimo2codex)",
           "reasoning": true,
           "thinkingLevelMap": {
             "off": null,

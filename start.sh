@@ -100,9 +100,9 @@ start_claude_proxy() {
 
     export OPENAI_API_KEY="${OPENAI_API_KEY:-sk-dummy}"
     export OPENAI_BASE_URL="${OPENAI_BASE_URL:-https://opencode.ai/zen/v1}"
-    export BIG_MODEL="${BIG_MODEL:-deepseek-v4-flash-free}"
+    export BIG_MODEL="${BIG_MODEL:-x-preview-f-free}"
     export MIDDLE_MODEL="${MIDDLE_MODEL:-${BIG_MODEL}}"
-    export SMALL_MODEL="${SMALL_MODEL:-deepseek-v4-flash-free}"
+    export SMALL_MODEL="${SMALL_MODEL:-x-preview-f-free}"
     export ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
     export PORT="$CLAUDE_PROXY_PORT"
     export LOG_LEVEL="WARNING"

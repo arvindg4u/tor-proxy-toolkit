@@ -3,7 +3,7 @@
 
 #:schema https://developers.openai.com/codex/config-schema.json
 
-model = "deepseek-v4-flash-free"
+model = "x-preview-f-free"
 model_provider = "zen-proxy"
 model_reasoning_effort = "xhigh"
 model_context_window = 1000000

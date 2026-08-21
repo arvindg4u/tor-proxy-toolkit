@@ -1,6 +1,6 @@
 {
   "defaultProvider": "opencode",
-  "defaultModel": "deepseek-v4-flash-free",
+  "defaultModel": "x-preview-f-free",
   "defaultThinkingLevel": "xhigh",
   "mcpServers": {
     "web-search": {
