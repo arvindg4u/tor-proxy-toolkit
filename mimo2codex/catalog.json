@@ -4,7 +4,7 @@
    "slug": "x-preview-f-free",
    "display_name": "X Preview F Free (OpenCode ZEN)",
    "description": "Free x-preview-f model served through the OpenCode ZEN proxy with a 1M context window.",
-   "default_reasoning_level": "xhigh",
+   "default_reasoning_level": "max",
    "supported_reasoning_levels": [
     {
      "effort": "low",
@@ -19,8 +19,8 @@
      "description": "Greater reasoning depth for complex problems"
     },
     {
-     "effort": "xhigh",
-     "description": "Extra high reasoning depth for complex problems"
+     "effort": "max",
+     "description": "Maximum reasoning depth"
     }
    ],
    "shell_type": "shell_command",
