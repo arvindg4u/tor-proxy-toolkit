@@ -1,6 +1,6 @@
 {
   "defaultProvider": "opencode",
-  "defaultModel": "x-preview-f-free",
+  "defaultModel": "moonshotai/kimi-k3",
   "defaultThinkingLevel": "xhigh",
   "mcpServers": {
     "web-search": {

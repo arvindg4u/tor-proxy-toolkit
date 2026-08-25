@@ -3,15 +3,15 @@
 
 #:schema https://developers.openai.com/codex/config-schema.json
 
-model = "x-preview-f-free"
+model = "moonshotai/kimi-k3"
 model_provider = "zen-proxy"
 model_reasoning_effort = "max"
 model_context_window = 1000000
 model_max_output = 128000
 service_tier = "default"
 
-# Model metadata catalog so Codex trusts the 1M context window
-# (without it, Codex falls back to ~258K and compacts too early).
+# Model metadata catalog so Codex trusts the context window and reasoning
+# levels (accepts low/medium/high/max — NOT xhigh).
 # Copy catalog.json next to this config: cp mimo2codex/catalog.json ~/.codex/catalog.json
 model_catalog_json = "~/.codex/catalog.json"
 
@@ -25,7 +25,7 @@ web_search = "live"
 hide_full_access_warning = true
 
 [model_providers.zen-proxy]
-name = "OpenCode ZEN (via mimo2codex proxy)"
+name = "NVIDIA NIM / OpenCode ZEN (via mimo2codex proxy)"
 base_url = "http://127.0.0.1:8788/v1"
 env_key = "OPENAI_API_KEY"
 wire_api = "responses"

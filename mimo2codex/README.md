@@ -1,6 +1,8 @@
 # mimo2codex Proxy Setup
 
 `mimo2codex` is a global npm package that provides an OpenAI-compatible proxy for Codex CLI.
+Default upstream: **NVIDIA NIM** (`https://integrate.api.nvidia.com/v1`) serving
+**Moonshot Kimi K3**. An OpenCode ZEN (free-tier) config is included as an alternative.
 
 ## Installation
 
@@ -13,10 +15,10 @@ npm install -g mimo2codex
 1. Copy `.env.example` to `~/.mimo2codex/.env`:
 ```bash
 cp mimo2codex/.env.example ~/.mimo2codex/.env
-nano ~/.mimo2codex/.env  # Add your API key
+nano ~/.mimo2codex/.env  # Add your NVIDIA nvapi key (free at build.nvidia.com)
 ```
 
-2. Apply the User-Agent fix (REQUIRED, see below):
+2. Apply the User-Agent fix (required for the OpenCode ZEN backend, harmless with NVIDIA):
 ```bash
 bash mimo2codex/patch-user-agent.sh
 ```
@@ -28,61 +30,60 @@ mimo2codex --model generic
 
 4. The proxy runs on `http://127.0.0.1:8788` by default.
 
-### ⚠️ Fixing 429 "FreeUsageLimitError" after a few turns
+### Switching models
 
-The zen backend (`opencode.ai/zen`) rate-limits **by User-Agent**. The stock
-mimo2codex sends `User-Agent: mimo2codex/<version>` upstream, which zen puts
-on a tiny "bot tier" — it 429s after a few turns even from a fresh IP. The
-real opencode CLI sends `User-Agent: opencode/<version>` and gets the normal
-free tier.
+Any model id from `https://integrate.api.nvidia.com/v1/models` works — set it in
+`.env` (`GENERIC_DEFAULT_MODEL=...`) and restart. Verified good picks:
 
-The fix makes the proxy send the opencode CLI UA upstream:
+| Model | Notes |
+|---|---|
+| `moonshotai/kimi-k3` | default; accepts reasoning effort low/medium/high/max |
+| `deepseek-ai/deepseek-v4-flash-0731` | fast |
+| `nvidia/nemotron-3-ultra-550b-a55b` | flagship NVIDIA |
+| `openai/gpt-oss-120b` | deep reasoning but very slow |
 
-```bash
-# 1. Patch the installed package (idempotent)
-bash mimo2codex/patch-user-agent.sh
+> Reasoning-effort gotcha: models only accept `low / medium / high / max`.
+> Codex's `xhigh` gets rejected ([1210] error) — use `max` in `config.toml`
+> and list it in `catalog.json`.
 
-# 2. Ensure ~/.mimo2codex/.env has (already present in .env.example):
-#    MIMO2CODEX_UPSTREAM_USER_AGENT=opencode/1.18.18
+### Alternative backend: OpenCode ZEN (free tier)
 
-# 3. Restart the proxy
-pkill -9 -f "pkg/dist/cli.js --model generic"
-mimo2codex --model generic
-```
+Uncomment the ZEN block in `.env.example`. Caveats:
 
-> **Re-apply after every restart/reinstall**: `npm i -g mimo2codex` ships the
-> unpatched `config.js`, so the patch script must be run again. On Lightning
-> Studios only `/this_studio` persists — keep the patched package + wrapper
-> there (`~/.mimo2codex/pkg/`) and start it with the local copy.
+- **429 "FreeUsageLimitError" after a few turns** — zen rate-limits **by
+  User-Agent**: stock mimo2codex sends `User-Agent: mimo2codex/<version>` and
+  is put on a tiny "bot tier"; the opencode CLI's UA gets the normal tier.
+  Fix with `patch-user-agent.sh` + `MIMO2CODEX_UPSTREAM_USER_AGENT=opencode/1.18.18`.
+- Only `*-free`-suffixed models are free, and they flap in/out of availability
+  (`x-preview-f-free`, `mimo-v2.5-free`, `hy3-free`, `nemotron-*-free`, ...).
+  Check with a direct curl before blaming your setup.
 
-Verify the fix with a direct call (expect HTTP 200, not 429):
+Verify the proxy with a direct call (expect HTTP 200):
 ```bash
 curl -s -o /dev/null -w "%{http_code}\n" \
   http://127.0.0.1:8788/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sk-your-api-key" \
-  -d '{"model":"x-preview-f-free","messages":[{"role":"user","content":"hi"}],"stream":false}'
+  -d '{"model":"moonshotai/kimi-k3","messages":[{"role":"user","content":"hi"}],"stream":false}'
 ```
 
 ## Codex CLI Integration
 
 Add to `~/.codex/config.toml`:
 ```toml
-model = "x-preview-f-free"
+model = "moonshotai/kimi-k3"
 model_provider = "zen-proxy"
 
 [model_providers.zen-proxy]
-name = "OpenCode ZEN (via proxy)"
+name = "NVIDIA NIM (via proxy)"
 base_url = "http://127.0.0.1:8788/v1"
 env_key = "OPENAI_API_KEY"
 wire_api = "responses"
 ```
 
-### 1M context window (important)
+### Model catalog (important)
 
-Without metadata, Codex falls back to a conservative ~258K window and compacts
-too early — the upstream really does accept 1M tokens, but Codex won't use it.
-Fix it with a model catalog:
+Without metadata, Codex guesses a conservative context window and compacts too
+early. The catalog also defines which reasoning efforts Codex offers.
 
 ```bash
 cp mimo2codex/catalog.json ~/.codex/catalog.json
@@ -95,7 +96,7 @@ model_catalog_json = "~/.codex/catalog.json"
 
 Verify with:
 ```bash
-codex debug models   # x-preview-f-free should show context_window: 1000000
+codex debug models   # moonshotai/kimi-k3 should show context_window: 1000000
 ```
 
 ## Using with Tor

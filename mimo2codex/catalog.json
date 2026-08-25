@@ -1,9 +1,9 @@
 {
  "models": [
   {
-   "slug": "x-preview-f-free",
-   "display_name": "X Preview F Free (OpenCode ZEN)",
-   "description": "Free x-preview-f model served through the OpenCode ZEN proxy with a 1M context window.",
+   "slug": "moonshotai/kimi-k3",
+   "display_name": "Kimi K3 (NVIDIA NIM)",
+   "description": "Moonshot Kimi K3 served via the NVIDIA NIM API through the mimo2codex proxy.",
    "default_reasoning_level": "max",
    "supported_reasoning_levels": [
     {
