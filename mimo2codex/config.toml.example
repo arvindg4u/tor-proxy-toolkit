@@ -3,9 +3,9 @@
 
 #:schema https://developers.openai.com/codex/config-schema.json
 
-model = "muse-spark-1.2-contributor-free"
+model = "laguna-s-2.1-free"
 model_provider = "zen-proxy"
-model_reasoning_effort = "max"
+model_reasoning_effort = "high"
 model_context_window = 1000000
 model_max_output = 128000
 service_tier = "default"

@@ -1,26 +1,18 @@
 {
  "models": [
   {
-   "slug": "muse-spark-1.2-contributor-free",
-   "display_name": "Muse Spark 1.2 Free (OpenCode ZEN)",
-   "description": "Muse Spark 1.2 Free served via the OpenCode ZEN proxy.",
-   "default_reasoning_level": "max",
+   "slug": "laguna-s-2.1-free",
+   "display_name": "Laguna S 2.1 Free (OpenCode ZEN)",
+   "description": "Laguna S 2.1 Free served via the OpenCode ZEN proxy.",
+   "default_reasoning_level": "high",
    "supported_reasoning_levels": [
     {
      "effort": "low",
-     "description": "Fast responses with lighter reasoning"
-    },
-    {
-     "effort": "medium",
-     "description": "Balances speed and reasoning depth for everyday tasks"
+     "description": "Fast responses"
     },
     {
      "effort": "high",
-     "description": "Greater reasoning depth for complex problems"
-    },
-    {
-     "effort": "max",
-     "description": "Maximum reasoning depth"
+     "description": "High reasoning depth"
     }
    ],
    "shell_type": "shell_command",
