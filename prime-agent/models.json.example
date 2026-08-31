@@ -1,28 +1,35 @@
 {
-  "providers": {
-    "opencode": {
-      "baseUrl": "http://127.0.0.1:8788/v1",
-      "api": "openai-completions",
-      "apiKey": "OPENAI_API_KEY",
-      "models": [
-        {
-          "id": "moonshotai/kimi-k3",
-          "name": "Kimi K3 (NVIDIA NIM via mimo2codex)",
-          "reasoning": true,
-          "thinkingLevelMap": {
-            "off": null,
-            "minimal": null,
-            "low": "low",
-            "medium": "medium",
-            "high": "high",
-            "xhigh": "max"
-          },
-          "input": ["text"],
-          "contextWindow": 1000000,
-          "maxTokens": 128000,
-          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
-        }
-      ]
+ "providers": {
+  "opencode": {
+   "baseUrl": "http://127.0.0.1:8788/v1",
+   "api": "openai-completions",
+   "apiKey": "OPENAI_API_KEY",
+   "models": [
+    {
+     "id": "muse-spark-1.2-contributor-free",
+     "name": "Muse Spark 1.2 Free (OpenCode ZEN via mimo2codex)",
+     "reasoning": true,
+     "thinkingLevelMap": {
+      "off": null,
+      "minimal": null,
+      "low": "low",
+      "medium": "medium",
+      "high": "high",
+      "xhigh": "max"
+     },
+     "input": [
+      "text"
+     ],
+     "contextWindow": 1000000,
+     "maxTokens": 128000,
+     "cost": {
+      "input": 0,
+      "output": 0,
+      "cacheRead": 0,
+      "cacheWrite": 0
+     }
     }
+   ]
   }
+ }
 }

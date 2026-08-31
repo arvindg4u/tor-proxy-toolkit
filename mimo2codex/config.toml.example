@@ -3,7 +3,7 @@
 
 #:schema https://developers.openai.com/codex/config-schema.json
 
-model = "moonshotai/kimi-k3"
+model = "muse-spark-1.2-contributor-free"
 model_provider = "zen-proxy"
 model_reasoning_effort = "max"
 model_context_window = 1000000
@@ -25,7 +25,7 @@ web_search = "live"
 hide_full_access_warning = true
 
 [model_providers.zen-proxy]
-name = "NVIDIA NIM / OpenCode ZEN (via mimo2codex proxy)"
+name = "OpenCode ZEN (via mimo2codex proxy)"
 base_url = "http://127.0.0.1:8788/v1"
 env_key = "OPENAI_API_KEY"
 wire_api = "responses"

@@ -1,9 +1,9 @@
 {
  "models": [
   {
-   "slug": "moonshotai/kimi-k3",
-   "display_name": "Kimi K3 (NVIDIA NIM)",
-   "description": "Moonshot Kimi K3 served via the NVIDIA NIM API through the mimo2codex proxy.",
+   "slug": "muse-spark-1.2-contributor-free",
+   "display_name": "Muse Spark 1.2 Free (OpenCode ZEN)",
+   "description": "Muse Spark 1.2 Free served via the OpenCode ZEN proxy.",
    "default_reasoning_level": "max",
    "supported_reasoning_levels": [
     {

@@ -1,6 +1,6 @@
 {
   "defaultProvider": "opencode",
-  "defaultModel": "moonshotai/kimi-k3",
+  "defaultModel": "muse-spark-1.2-contributor-free",
   "defaultThinkingLevel": "xhigh",
   "mcpServers": {
     "web-search": {

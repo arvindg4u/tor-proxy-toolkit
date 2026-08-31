@@ -1,7 +1,8 @@
 # mimo2codex Proxy Setup
 
 `mimo2codex` is a global npm package that provides an OpenAI-compatible proxy for Codex CLI.
-Default upstream: **NVIDIA NIM** (`https://integrate.api.nvidia.com/v1`) serving
+Default upstream: **OpenCode ZEN** (`https://opencode.ai/zen/v1`) serving
+**Muse Spark 1.2 Free**. An NVIDIA NIM config is included as an alternative.
 **Moonshot Kimi K3**. An OpenCode ZEN (free-tier) config is included as an alternative.
 
 ## Installation
@@ -37,7 +38,7 @@ Any model id from `https://integrate.api.nvidia.com/v1/models` works — set it 
 
 | Model | Notes |
 |---|---|
-| `moonshotai/kimi-k3` | default; accepts reasoning effort low/medium/high/max |
+| `muse-spark-1.2-contributor-free` | default; Muse Spark 1.2 Free |
 | `deepseek-ai/deepseek-v4-flash-0731` | fast |
 | `nvidia/nemotron-3-ultra-550b-a55b` | flagship NVIDIA |
 | `openai/gpt-oss-120b` | deep reasoning but very slow |
@@ -63,14 +64,14 @@ Verify the proxy with a direct call (expect HTTP 200):
 curl -s -o /dev/null -w "%{http_code}\n" \
   http://127.0.0.1:8788/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"moonshotai/kimi-k3","messages":[{"role":"user","content":"hi"}],"stream":false}'
+  -d '{"model":"muse-spark-1.2-contributor-free","messages":[{"role":"user","content":"hi"}],"stream":false}'
 ```
 
 ## Codex CLI Integration
 
 Add to `~/.codex/config.toml`:
 ```toml
-model = "moonshotai/kimi-k3"
+model = "muse-spark-1.2-contributor-free"
 model_provider = "zen-proxy"
 
 [model_providers.zen-proxy]
@@ -96,7 +97,7 @@ model_catalog_json = "~/.codex/catalog.json"
 
 Verify with:
 ```bash
-codex debug models   # moonshotai/kimi-k3 should show context_window: 1000000
+codex debug models   # muse-spark-1.2-contributor-free should show context_window: 1000000
 ```
 
 ## Using with Tor
