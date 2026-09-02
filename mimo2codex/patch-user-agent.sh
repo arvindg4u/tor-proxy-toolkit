@@ -23,12 +23,12 @@ else
   echo "patched UA: $CONFIG"
 fi
 GENJS="$PKG/dist/providers/generic.js"
-if grep -q 'Strip to .function. only' "$GENJS" 2>/dev/null; then
+if grep -q 'Convert custom' "$GENJS" 2>/dev/null; then
   echo "already patched (tools): $GENJS"
 else
   cp "$GENJS" "$GENJS.bak2" 2>/dev/null || true
-  # Insert tools filter at start of preprocessResponsesPassthrough
-  sed -i 's#preprocessResponsesPassthrough(req, _ctx) {#preprocessResponsesPassthrough(req, _ctx) {\n            if (Array.isArray(req.tools)) { const f=req.tools.filter(t=>t&&t.type==="function"); if(f.length!==req.tools.length) return {...req, tools:f}; }#' "$GENJS"
+  # Convert custom/namespace tools to function so all Codex tools stay natively callable via zen Muse Spark
+  sed -i 's#preprocessResponsesPassthrough(req, _ctx) {#preprocessResponsesPassthrough(req, _ctx) {\n            if (Array.isArray(req.tools)) { let ch=false; const c=req.tools.map(t=>{ if(!t||t.type==="function") return t; ch=true; const n={...t, type:"function"}; if(!n.parameters) n.parameters={type:"object", properties:{}}; return n; }); if(ch) return {...req, tools:c}; }#' "$GENJS"
   echo "patched tools: $GENJS"
 fi
 echo
