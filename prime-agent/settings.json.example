@@ -1,6 +1,6 @@
 {
   "defaultProvider": "opencode",
-  "defaultModel": "laguna-s-2.1-free",
+  "defaultModel": "muse-spark-1.2-contributor-free",
   "defaultThinkingLevel": "xhigh",
   "mcpServers": {
     "web-search": {

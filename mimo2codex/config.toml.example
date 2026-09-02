@@ -3,7 +3,7 @@
 
 #:schema https://developers.openai.com/codex/config-schema.json
 
-model = "laguna-s-2.1-free"
+model = "muse-spark-1.2-contributor-free"
 model_provider = "zen-proxy"
 model_reasoning_effort = "high"
 model_context_window = 1000000
