@@ -8,11 +8,17 @@ from typing import Optional
 from src.core.config import config
 from src.core.logging import logger
 from src.core.client import OpenAIClient
+from src.core.responses_client import ResponsesClient
 from src.models.claude import ClaudeMessagesRequest, ClaudeTokenCountRequest
 from src.conversion.request_converter import convert_claude_to_openai
+from src.conversion.request_responses import convert_claude_to_responses
 from src.conversion.response_converter import (
     convert_openai_to_claude_response,
     convert_openai_streaming_to_claude_with_cancellation,
+)
+from src.conversion.response_responses import (
+    convert_responses_to_claude_response,
+    convert_responses_streaming_to_claude_with_cancellation,
 )
 from src.core.model_manager import model_manager
 
@@ -26,6 +32,14 @@ openai_client = OpenAIClient(
     config.openai_base_url,
     config.request_timeout,
     api_version=config.azure_api_version,
+    custom_headers=custom_headers,
+)
+
+responses_client = ResponsesClient(
+    config.openai_api_key,
+    config.openai_base_url,
+    config.request_timeout,
+    user_agent=config.upstream_user_agent,
     custom_headers=custom_headers,
 )
 
@@ -60,6 +74,13 @@ async def create_message(request: ClaudeMessagesRequest, http_request: Request, 
 
         # Generate unique request ID for cancellation tracking
         request_id = str(uuid.uuid4())
+
+        # Responses wire path (for responses-only upstreams such as Muse
+        # Spark on OpenCode ZEN): Claude -> Responses -> Claude.
+        if config.upstream_wire_api == "responses":
+            return await _handle_responses_message(
+                request, http_request, request_id
+            )
 
         # Convert Claude request to OpenAI format
         openai_request = convert_claude_to_openai(request, model_manager)
@@ -121,6 +142,57 @@ async def create_message(request: ClaudeMessagesRequest, http_request: Request, 
         logger.error(traceback.format_exc())
         error_message = openai_client.classify_openai_error(str(e))
         raise HTTPException(status_code=500, detail=error_message)
+
+
+async def _handle_responses_message(request: ClaudeMessagesRequest, http_request: Request, request_id: str):
+    """Serve /v1/messages via the Responses API upstream."""
+    from src.core.responses_client import classify_responses_error
+
+    # Convert Claude request to Responses format
+    responses_request = convert_claude_to_responses(request, model_manager)
+
+    # Check if client disconnected before processing
+    if await http_request.is_disconnected():
+        raise HTTPException(status_code=499, detail="Client disconnected")
+
+    if request.stream:
+        try:
+            responses_stream = responses_client.create_response_stream(
+                responses_request, request_id
+            )
+            return StreamingResponse(
+                convert_responses_streaming_to_claude_with_cancellation(
+                    responses_stream,
+                    request,
+                    logger,
+                    http_request,
+                    responses_client,
+                    request_id,
+                ),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Headers": "*",
+                },
+            )
+        except HTTPException as e:
+            logger.error(f"Responses streaming error: {e.detail}")
+            import traceback
+
+            logger.error(traceback.format_exc())
+            error_message = classify_responses_error(e.detail)
+            error_response = {
+                "type": "error",
+                "error": {"type": "api_error", "message": error_message},
+            }
+            return JSONResponse(status_code=e.status_code, content=error_response)
+    else:
+        responses_object = await responses_client.create_response(
+            responses_request, request_id
+        )
+        return convert_responses_to_claude_response(responses_object, request)
 
 
 @router.post("/v1/messages/count_tokens")

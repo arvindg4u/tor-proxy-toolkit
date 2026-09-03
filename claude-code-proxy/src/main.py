@@ -21,9 +21,10 @@ def main():
         print("Optional environment variables:")
         print("  ANTHROPIC_API_KEY - Expected Anthropic API key for client validation")
         print("                      If set, clients must provide this exact API key")
-        print(
-            f"  OPENAI_BASE_URL - OpenAI API base URL (default: https://api.openai.com/v1)"
-        )
+        print(f"  OPENAI_BASE_URL - OpenAI API base URL (default: https://api.openai.com/v1)")
+        print(f"  UPSTREAM_WIRE_API - Upstream API: 'chat' (/chat/completions) or")
+        print(f"                      'responses' (/responses, for responses-only models)")
+        print(f"  UPSTREAM_USER_AGENT - User-Agent sent upstream (default: opencode/1.18.18)")
         print(f"  BIG_MODEL - Model for opus requests (default: gpt-4o)")
         print(f"  MIDDLE_MODEL - Model for sonnet requests (default: gpt-4o)")
         print(f"  SMALL_MODEL - Model for haiku requests (default: gpt-4o-mini)")
@@ -43,6 +44,7 @@ def main():
     print("🚀 Claude-to-OpenAI API Proxy v1.0.0")
     print(f"✅ Configuration loaded successfully")
     print(f"   OpenAI Base URL: {config.openai_base_url}")
+    print(f"   Upstream Wire API: {config.upstream_wire_api}")
     print(f"   Big Model (opus): {config.big_model}")
     print(f"   Middle Model (sonnet): {config.middle_model}")
     print(f"   Small Model (haiku): {config.small_model}")

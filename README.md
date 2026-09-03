@@ -120,6 +120,14 @@ BIG_MODEL=x-preview-f-free
 CLAUDE_PROXY_PORT=4013
 ```
 
+**Upstream wire API:** by default the proxy translates to
+`/chat/completions` (`UPSTREAM_WIRE_API=chat`). Responses-only models
+(e.g. `muse-spark-1.3-contributor-free`, which 500s on chat/completions)
+need `UPSTREAM_WIRE_API=responses` — the proxy then translates
+Claude → Responses API instead, with the opencode `User-Agent`
+(`UPSTREAM_USER_AGENT`) and SSE keepalives (`STREAM_KEEPALIVE_SECS`)
+so long reasoning pauses don't trip the CLI's idle watchdogs.
+
 ### 🎯 MiMo2Codex Proxy (Codex CLI)
 
 Global npm package (`mimo2codex`) that provides an OpenAI-compatible Responses API proxy on port 8788. Codex CLI connects to this.

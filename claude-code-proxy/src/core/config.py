@@ -29,6 +29,30 @@ class Config:
         self.big_model = os.environ.get("BIG_MODEL", "gpt-4o")
         self.middle_model = os.environ.get("MIDDLE_MODEL", self.big_model)
         self.small_model = os.environ.get("SMALL_MODEL", "gpt-4o-mini")
+
+        # Upstream wire API: "chat" (default, /chat/completions) or
+        # "responses" (/responses passthrough-style translation).
+        # Some free-tier models (e.g. Muse Spark on OpenCode ZEN) are
+        # responses-only upstream and 500 on chat/completions.
+        self.upstream_wire_api = os.environ.get("UPSTREAM_WIRE_API", "chat").strip().lower()
+        if self.upstream_wire_api not in ("chat", "responses"):
+            print(f"Warning: unknown UPSTREAM_WIRE_API '{self.upstream_wire_api}', falling back to 'chat'.")
+            self.upstream_wire_api = "chat"
+
+        # Upstream User-Agent. ZEN rate-limits by UA: only opencode client UAs
+        # get the normal free tier, everything else is treated as bot traffic.
+        self.upstream_user_agent = os.environ.get("UPSTREAM_USER_AGENT", "opencode/1.18.18")
+
+        # Floor for max_output_tokens on the responses path: reasoning models
+        # burn tokens before producing visible output.
+        self.responses_min_output_tokens = int(os.environ.get("RESPONSES_MIN_OUTPUT_TOKENS", "2048"))
+
+        # SSE keepalive interval (seconds) on the responses streaming path.
+        # Reasoning upstreams can go silent for minutes; Claude Code shows
+        # "Waiting for API response" after ~20s of no bytes and aborts the
+        # stream at its idle watchdogs. Periodic ping events reset those
+        # timers. 0 disables.
+        self.stream_keepalive_secs = float(os.environ.get("STREAM_KEEPALIVE_SECS", "15"))
         
     def validate_api_key(self):
         """Basic API key validation"""
