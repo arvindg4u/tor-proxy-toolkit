@@ -3,15 +3,15 @@
 
 #:schema https://developers.openai.com/codex/config-schema.json
 
-model = "muse-spark-1.2-contributor-free"
+model = "muse-spark-1.3-contributor-free"
 model_provider = "zen-proxy"
-model_reasoning_effort = "high"
+model_reasoning_effort = "xhigh"
 model_context_window = 1000000
 model_max_output = 128000
 service_tier = "default"
 
 # Model metadata catalog so Codex trusts the context window and reasoning
-# levels (accepts low/medium/high/max — NOT xhigh).
+# levels (Muse Spark accepts low/medium/high/xhigh).
 # Copy catalog.json next to this config: cp mimo2codex/catalog.json ~/.codex/catalog.json
 model_catalog_json = "~/.codex/catalog.json"
 

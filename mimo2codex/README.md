@@ -2,8 +2,7 @@
 
 `mimo2codex` is a global npm package that provides an OpenAI-compatible proxy for Codex CLI.
 Default upstream: **OpenCode ZEN** (`https://opencode.ai/zen/v1`) serving
-**Muse Spark 1.2 Free**. An NVIDIA NIM config is included as an alternative.
-**Moonshot Kimi K3**. An OpenCode ZEN (free-tier) config is included as an alternative.
+**Muse Spark 1.3 Free**. An NVIDIA NIM config is included as an alternative.
 
 ## Installation
 
@@ -16,7 +15,7 @@ npm install -g mimo2codex
 1. Copy `.env.example` to `~/.mimo2codex/.env`:
 ```bash
 cp mimo2codex/.env.example ~/.mimo2codex/.env
-nano ~/.mimo2codex/.env  # Add your NVIDIA nvapi key (free at build.nvidia.com)
+nano ~/.mimo2codex/.env  # Add your OpenCode API key
 ```
 
 2. Apply the User-Agent fix (required for the OpenCode ZEN backend, harmless with NVIDIA):
@@ -38,14 +37,13 @@ Any model id from `https://integrate.api.nvidia.com/v1/models` works — set it 
 
 | Model | Notes |
 |---|---|
-| `muse-spark-1.2-contributor-free` | default; Muse Spark 1.2 Free |
+| `muse-spark-1.3-contributor-free` | default; Muse Spark 1.3 Free |
 | `deepseek-ai/deepseek-v4-flash-0731` | fast |
 | `nvidia/nemotron-3-ultra-550b-a55b` | flagship NVIDIA |
 | `openai/gpt-oss-120b` | deep reasoning but very slow |
 
-> Reasoning-effort gotcha: models only accept `low / medium / high / max`.
-> Codex's `xhigh` gets rejected ([1210] error) — use `max` in `config.toml`
-> and list it in `catalog.json`.
+> Reasoning-effort gotcha: Muse Spark on zen accepts `low / medium / high / xhigh`.
+> Some other models reject `xhigh`; for those, use a supported level such as `max`.
 
 ### Alternative backend: OpenCode ZEN (free tier)
 
@@ -62,20 +60,20 @@ Uncomment the ZEN block in `.env.example`. Caveats:
 Verify the proxy with a direct call (expect HTTP 200):
 ```bash
 curl -s -o /dev/null -w "%{http_code}\n" \
-  http://127.0.0.1:8788/v1/chat/completions \
+  http://127.0.0.1:8788/v1/responses \
   -H "Content-Type: application/json" \
-  -d '{"model":"muse-spark-1.2-contributor-free","messages":[{"role":"user","content":"hi"}],"stream":false}'
+  -d '{"model":"muse-spark-1.3-contributor-free","input":"hi"}'
 ```
 
 ## Codex CLI Integration
 
 Add to `~/.codex/config.toml`:
 ```toml
-model = "muse-spark-1.2-contributor-free"
+model = "muse-spark-1.3-contributor-free"
 model_provider = "zen-proxy"
 
 [model_providers.zen-proxy]
-name = "NVIDIA NIM (via proxy)"
+name = "OpenCode ZEN (via proxy)"
 base_url = "http://127.0.0.1:8788/v1"
 env_key = "OPENAI_API_KEY"
 wire_api = "responses"
@@ -97,7 +95,7 @@ model_catalog_json = "~/.codex/catalog.json"
 
 Verify with:
 ```bash
-codex debug models   # muse-spark-1.2-contributor-free should show context_window: 1000000
+codex debug models   # muse-spark-1.3-contributor-free should show context_window: 1000000
 ```
 
 ## Using with Tor
