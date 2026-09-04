@@ -128,6 +128,14 @@ Claude → Responses API instead, with the opencode `User-Agent`
 (`UPSTREAM_USER_AGENT`) and SSE keepalives (`STREAM_KEEPALIVE_SECS`)
 so long reasoning pauses don't trip the CLI's idle watchdogs.
 
+Two more resilience knobs on the responses path:
+- `RESPONSES_RETRY_BUDGET_SECS` (default 120) — keeps retrying
+  retryable upstream 5xx with backoff, so free-tier flaps resolve
+  inside the proxy instead of surfacing to the CLI.
+- Auto-compact fix — `function_call_output` items are emitted before
+  any text in a message, since the provider rejects a message placed
+  between a `function_call` and its output (this broke compaction).
+
 ### 🎯 MiMo2Codex Proxy (Codex CLI)
 
 Global npm package (`mimo2codex`) that provides an OpenAI-compatible Responses API proxy on port 8788. Codex CLI connects to this.

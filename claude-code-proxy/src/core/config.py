@@ -47,6 +47,12 @@ class Config:
         # burn tokens before producing visible output.
         self.responses_min_output_tokens = int(os.environ.get("RESPONSES_MIN_OUTPUT_TOKENS", "2048"))
 
+        # How long (seconds) the responses path keeps retrying retryable
+        # upstream failures (5xx) with exponential backoff before giving up.
+        # Muse Spark free tier flaps; the CLI retries too, but absorbing
+        # short outages here avoids CLI-visible errors entirely.
+        self.responses_retry_budget_secs = float(os.environ.get("RESPONSES_RETRY_BUDGET_SECS", "120"))
+
         # SSE keepalive interval (seconds) on the responses streaming path.
         # Reasoning upstreams can go silent for minutes; Claude Code shows
         # "Waiting for API response" after ~20s of no bytes and aborts the

@@ -175,7 +175,13 @@ def _user_text_item(text: str) -> Dict[str, Any]:
 
 
 def _convert_user_message(msg: ClaudeMessage) -> List[Dict[str, Any]]:
-    """User message -> user message item + function_call_output items."""
+    """User message -> user message item + function_call_output items.
+
+    Outputs are ALWAYS emitted before any text item. The upstream provider
+    rejects (400/500) a `message` item placed between a `function_call` and
+    its `function_call_output`, which is exactly what happens during
+    compaction when a tool_result message also carries text.
+    """
     items: List[Dict[str, Any]] = []
     content = msg.content
     if content is None:
@@ -218,13 +224,12 @@ def _convert_user_message(msg: ClaudeMessage) -> List[Dict[str, Any]]:
                 }
             )
     if text_parts:
-        items.insert(
-            0,
+        items.append(
             {
                 "type": "message",
                 "role": Constants.ROLE_USER,
                 "content": text_parts,
-            },
+            }
         )
     return items
 

@@ -2,10 +2,13 @@
 
 import asyncio
 import json
+import logging
 from typing import Any, AsyncGenerator, Dict, Optional
 
 import httpx
 from fastapi import HTTPException
+
+logger = logging.getLogger(__name__)
 
 
 def classify_responses_error(error_detail: Any) -> str:
@@ -41,6 +44,7 @@ class ResponsesClient:
         timeout: int = 90,
         user_agent: Optional[str] = None,
         custom_headers: Optional[Dict[str, str]] = None,
+        retry_budget_secs: float = 120,
     ):
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
@@ -52,10 +56,40 @@ class ResponsesClient:
         }
         if custom_headers:
             self.headers.update(custom_headers)
+        self.retry_budget_secs = retry_budget_secs
         self.active_requests: Dict[str, asyncio.Event] = {}
 
     def _url(self) -> str:
         return f"{self.base_url}/responses"
+
+    @staticmethod
+    def _dump_failed_payload(payload: Dict[str, Any], status: int) -> None:
+        """Save the failing payload locally for diagnosis (no credentials)."""
+        import os
+
+        try:
+            log_dir = os.environ.get("PROXY_LOG_DIR", "logs")
+            os.makedirs(log_dir, exist_ok=True)
+            path = os.path.join(log_dir, "last_upstream_failure.json")
+            with open(path, "w") as f:
+                json.dump({"status": status, "payload": payload}, f, ensure_ascii=False)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _retryable(exc: HTTPException) -> bool:
+        """Only server-side 5xx are worth retrying (never 4xx/499)."""
+        return exc.status_code is not None and exc.status_code >= 500
+
+    async def _backoff(self, attempt: int, deadline: float) -> bool:
+        """Sleep with exponential backoff; False when the budget is spent."""
+        import time
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        await asyncio.sleep(min(2**attempt, 30, remaining))
+        return True
 
     async def create_response(
         self, payload: Dict[str, Any], request_id: Optional[str] = None
@@ -64,13 +98,32 @@ class ResponsesClient:
         if request_id:
             self.active_requests[request_id] = asyncio.Event()
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                resp = await client.post(self._url(), json=payload, headers=self.headers)
-            if resp.status_code >= 400:
-                raise HTTPException(
-                    status_code=resp.status_code,
-                    detail=classify_responses_error(resp.text),
-                )
+            import time
+
+            deadline = time.monotonic() + self.retry_budget_secs
+            attempt = 0
+            while True:
+                try:
+                    async with httpx.AsyncClient(timeout=self.timeout) as client:
+                        resp = await client.post(self._url(), json=payload, headers=self.headers)
+                    if resp.status_code >= 400:
+                        self._dump_failed_payload(payload, resp.status_code)
+                        raise HTTPException(
+                            status_code=resp.status_code,
+                            detail=classify_responses_error(resp.text),
+                        )
+                    break
+                except HTTPException as e:
+                    if self._retryable(e) and await self._backoff(attempt, deadline):
+                        attempt += 1
+                        logger.warning(
+                            "Upstream %s (model=%s), retrying in budget (attempt %d)",
+                            e.status_code,
+                            payload.get("model"),
+                            attempt,
+                        )
+                        continue
+                    raise
             data = resp.json()
             if isinstance(data, dict) and data.get("type") == "error":
                 raise HTTPException(
@@ -94,47 +147,80 @@ class ResponsesClient:
         """POST a streaming Responses request, yielding one SSE event per item.
 
         Each yielded string has the form ``"event: <type>\\ndata: <json>"``.
+
+        The upstream POST + status check happen lazily on first iteration,
+        so callers serving an already-started HTTP stream should prime the
+        generator first (see :func:`prime_response_stream`) to surface
+        upstream rejections before response headers go out.
         """
         if request_id:
             self.active_requests[request_id] = asyncio.Event()
         try:
             body = dict(payload)
             body["stream"] = True
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                async with client.stream(
-                    "POST", self._url(), json=body, headers=self.headers
-                ) as resp:
-                    if resp.status_code >= 400:
-                        err_body = await resp.aread()
-                        raise HTTPException(
-                            status_code=resp.status_code,
-                            detail=classify_responses_error(
-                                err_body.decode("utf-8", "replace")
-                            ),
-                        )
-                    event_type: Optional[str] = None
-                    data_lines: list = []
-                    async for line in resp.aiter_lines():
-                        if request_id and self.active_requests.get(request_id) is not None:
-                            if self.active_requests[request_id].is_set():
+            import time
+
+            deadline = time.monotonic() + self.retry_budget_secs
+            attempt = 0
+            yielded_any = False
+            while True:
+                try:
+                    async with httpx.AsyncClient(timeout=self.timeout) as client:
+                        async with client.stream(
+                            "POST", self._url(), json=body, headers=self.headers
+                        ) as resp:
+                            if resp.status_code >= 400:
+                                err_body = await resp.aread()
+                                self._dump_failed_payload(body, resp.status_code)
                                 raise HTTPException(
-                                    status_code=499,
-                                    detail="Request cancelled by client",
+                                    status_code=resp.status_code,
+                                    detail=classify_responses_error(
+                                        err_body.decode("utf-8", "replace")
+                                    ),
                                 )
-                        if not line.strip():
+                            event_type: Optional[str] = None
+                            data_lines: list = []
+                            async for line in resp.aiter_lines():
+                                if request_id and self.active_requests.get(request_id) is not None:
+                                    if self.active_requests[request_id].is_set():
+                                        raise HTTPException(
+                                            status_code=499,
+                                            detail="Request cancelled by client",
+                                        )
+                                if not line.strip():
+                                    if event_type is not None or data_lines:
+                                        data = "\n".join(data_lines)
+                                        yielded_any = True
+                                        yield f"event: {event_type or 'message'}\ndata: {data}"
+                                    event_type, data_lines = None, []
+                                    continue
+                                if line.startswith("event:"):
+                                    event_type = line[6:].strip()
+                                elif line.startswith("data:"):
+                                    data_lines.append(line[5:].strip())
+                                # ignore ":" comments and other fields
                             if event_type is not None or data_lines:
                                 data = "\n".join(data_lines)
+                                yielded_any = True
                                 yield f"event: {event_type or 'message'}\ndata: {data}"
-                            event_type, data_lines = None, []
-                            continue
-                        if line.startswith("event:"):
-                            event_type = line[6:].strip()
-                        elif line.startswith("data:"):
-                            data_lines.append(line[5:].strip())
-                        # ignore ":" comments and other fields
-                    if event_type is not None or data_lines:
-                        data = "\n".join(data_lines)
-                        yield f"event: {event_type or 'message'}\ndata: {data}"
+                    break
+                except HTTPException as e:
+                    # Retryable only before any bytes were yielded (safe:
+                    # nothing sent downstream yet) and within budget.
+                    if (
+                        not yielded_any
+                        and self._retryable(e)
+                        and await self._backoff(attempt, deadline)
+                    ):
+                        attempt += 1
+                        logger.warning(
+                            "Upstream stream %s (model=%s), retrying in budget (attempt %d)",
+                            e.status_code,
+                            body.get("model"),
+                            attempt,
+                        )
+                        continue
+                    raise
         except HTTPException:
             raise
         except Exception as e:
@@ -151,3 +237,21 @@ class ResponsesClient:
             self.active_requests[request_id].set()
             return True
         return False
+
+
+async def prime_response_stream(async_gen):
+    """Pull the first event, returning a chained generator.
+
+    Forces the upstream POST + status check to happen now, so an
+    HTTPException for an upstream rejection is raised before the caller
+    starts its own HTTP response. The first event is replayed, so no data
+    is lost.
+    """
+    first = await async_gen.__anext__()
+
+    async def chained():
+        yield first
+        async for event in async_gen:
+            yield event
+
+    return chained()

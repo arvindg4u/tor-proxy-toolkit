@@ -8,7 +8,7 @@ from typing import Optional
 from src.core.config import config
 from src.core.logging import logger
 from src.core.client import OpenAIClient
-from src.core.responses_client import ResponsesClient
+from src.core.responses_client import ResponsesClient, prime_response_stream
 from src.models.claude import ClaudeMessagesRequest, ClaudeTokenCountRequest
 from src.conversion.request_converter import convert_claude_to_openai
 from src.conversion.request_responses import convert_claude_to_responses
@@ -41,6 +41,7 @@ responses_client = ResponsesClient(
     config.request_timeout,
     user_agent=config.upstream_user_agent,
     custom_headers=custom_headers,
+    retry_budget_secs=config.responses_retry_budget_secs,
 )
 
 async def validate_api_key(x_api_key: Optional[str] = Header(None), authorization: Optional[str] = Header(None)):
@@ -160,6 +161,10 @@ async def _handle_responses_message(request: ClaudeMessagesRequest, http_request
             responses_stream = responses_client.create_response_stream(
                 responses_request, request_id
             )
+            # Prime before headers go out: forces the upstream POST + status
+            # check now, so an upstream rejection becomes a JSON error
+            # instead of a killed stream mid-response.
+            responses_stream = await prime_response_stream(responses_stream)
             return StreamingResponse(
                 convert_responses_streaming_to_claude_with_cancellation(
                     responses_stream,
