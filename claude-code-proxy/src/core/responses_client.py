@@ -20,6 +20,13 @@ def classify_responses_error(error_detail: Any) -> str:
             "Free-tier rate limit exceeded. Wait before retrying, or check the "
             "upstream User-Agent allowlist (bot UAs get a tiny quota)."
         )
+    if "missingsession" in error_str or "only be used in opencode" in error_str:
+        return (
+            "Upstream rejected the request as non-OpenCode traffic "
+            "(MissingSessionID). The proxy sends x-opencode-session "
+            "automatically — restart it to pick up the fix, or set "
+            "OPENCODE_SESSION_ID explicitly."
+        )
     if "credits" in error_str or "payment" in error_str or "billing" in error_str:
         return (
             "Upstream reports missing credits/payment method. Use a *-free "

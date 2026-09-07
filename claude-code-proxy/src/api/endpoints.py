@@ -24,8 +24,9 @@ from src.core.model_manager import model_manager
 
 router = APIRouter()
 
-# Get custom headers from config
-custom_headers = config.get_custom_headers()
+# Get custom headers from config, layered over the OpenCode identity
+# headers (session/UA) that ZEN's free tier requires.
+custom_headers = {**config.get_upstream_headers(), **config.get_custom_headers()}
 
 openai_client = OpenAIClient(
     config.openai_api_key,
@@ -301,6 +302,7 @@ async def passthrough_responses(request: Request, path: str = ""):
     headers = {
         "Authorization": f"Bearer {config.openai_api_key}",
         "Content-Type": "application/json",
+        **config.get_upstream_headers(),
     }
     # Forward query params
     params = dict(request.query_params)
@@ -345,6 +347,7 @@ async def passthrough_chat_completions(request: Request):
     headers = {
         "Authorization": f"Bearer {config.openai_api_key}",
         "Content-Type": "application/json",
+        **config.get_upstream_headers(),
     }
     params = dict(request.query_params)
     

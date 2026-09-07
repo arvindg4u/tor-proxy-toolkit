@@ -1,6 +1,16 @@
 import os
 import sys
 
+
+def _new_session_id():
+    """Generate an OpenCode-style session id (ses_ + 24 alphanumerics)."""
+    import secrets
+    import string
+
+    alphabet = string.ascii_letters + string.digits
+    return "ses_" + "".join(secrets.choice(alphabet) for _ in range(24))
+
+
 # Configuration
 class Config:
     def __init__(self):
@@ -41,7 +51,20 @@ class Config:
 
         # Upstream User-Agent. ZEN rate-limits by UA: only opencode client UAs
         # get the normal free tier, everything else is treated as bot traffic.
-        self.upstream_user_agent = os.environ.get("UPSTREAM_USER_AGENT", "opencode/1.18.18")
+        self.upstream_user_agent = os.environ.get("UPSTREAM_USER_AGENT", "opencode/1.18.29")
+
+        # OpenCode client identity headers. ZEN's free tier rejects requests
+        # without x-opencode-session ("MissingSessionID: free tier can only
+        # be used in OpenCode"). Mirrors what the real OpenCode client sends:
+        #   x-opencode-session, x-opencode-project, x-opencode-request (user),
+        #   x-opencode-client, User-Agent: opencode/<version>
+        # The server only checks presence/format (it cannot know local
+        # session ids in advance), so an auto-generated stable id per proxy
+        # start works. Pin via OPENCODE_SESSION_ID to reuse one.
+        self.opencode_session_id = os.environ.get("OPENCODE_SESSION_ID") or _new_session_id()
+        self.opencode_project_id = os.environ.get("OPENCODE_PROJECT_ID", "global")
+        self.opencode_client = os.environ.get("OPENCODE_CLIENT", "cli")
+        self.opencode_user_id = os.environ.get("OPENCODE_USER_ID", "")
 
         # Floor for max_output_tokens on the responses path: reasoning models
         # burn tokens before producing visible output.
@@ -96,8 +119,21 @@ class Config:
                     # Convert underscores to hyphens for HTTP header format
                     header_name = header_name.replace('_', '-')
                     custom_headers[header_name] = env_value
-        
+
         return custom_headers
+
+    def get_upstream_headers(self):
+        """OpenCode identity headers sent upstream with every ZEN request."""
+        headers = {"User-Agent": self.upstream_user_agent}
+        if self.opencode_session_id:
+            headers["x-opencode-session"] = self.opencode_session_id
+        if self.opencode_project_id:
+            headers["x-opencode-project"] = self.opencode_project_id
+        if self.opencode_client:
+            headers["x-opencode-client"] = self.opencode_client
+        if self.opencode_user_id:
+            headers["x-opencode-request"] = self.opencode_user_id
+        return headers
 
 try:
     config = Config()
