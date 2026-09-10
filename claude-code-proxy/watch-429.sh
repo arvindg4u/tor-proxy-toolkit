@@ -6,6 +6,11 @@
 cd "$(dirname "$0")"
 FILE="logs/last_upstream_failure.json"
 PIDFILE="/tmp/wgtunnel-proxy.pid"
+# Debounce: upstream rewrites the file on EVERY failed attempt, so without
+# this one 429 incident would rotate every 10s and get us server-side
+# throttled. One rotation per incident, then silence for 5 min.
+COOLDOWN_SECS=300
+next_allowed=0
 # Ignore failures that predate the watcher start.
 last=""
 [ -f "$FILE" ] && last=$(stat -c %Y "$FILE")
@@ -16,10 +21,16 @@ while true; do
     st=$(python3 -c "import json;print(json.load(open('$FILE')).get('status',''))" 2>/dev/null)
     if [ "$cur" != "$last" ] && [ "$st" = "429" ]; then
       last="$cur"
-      if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-        kill -USR1 "$(cat "$PIDFILE")" && echo "$(date '+%F %T'): upstream 429, rotated wgtunnel"
+      now=$(date +%s)
+      if [ "$now" -ge "$next_allowed" ]; then
+        next_allowed=$((now + COOLDOWN_SECS))
+        if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+          kill -USR1 "$(cat "$PIDFILE")" && echo "$(date '+%F %T'): upstream 429, rotated wgtunnel (cooldown ${COOLDOWN_SECS}s)"
+        else
+          echo "$(date '+%F %T'): upstream 429 but wgtunnel proxy not running"
+        fi
       else
-        echo "$(date '+%F %T'): upstream 429 but wgtunnel proxy not running"
+        echo "$(date '+%F %T'): upstream 429 within cooldown, skipping"
       fi
     fi
   fi
