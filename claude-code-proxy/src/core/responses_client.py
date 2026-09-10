@@ -133,9 +133,24 @@ class ResponsesClient:
                     raise
             data = resp.json()
             if isinstance(data, dict) and data.get("type") == "error":
+                err_text = json.dumps(data)
+                detail = classify_responses_error(err_text)
+                lowered = err_text.lower()
+                if (
+                    "freelimit" in lowered
+                    or "free usage" in lowered
+                    or "429" in lowered
+                    or "rate limit" in lowered
+                ):
+                    # Upstream HTTP 200 carrying a rate-limit error body
+                    # (e.g. FreeUsageLimitError): signal it like an HTTP 429
+                    # so the failure watcher rotates the egress peer.
+                    self._dump_failed_payload(payload, 429)
+                    raise HTTPException(status_code=429, detail=detail)
+                self._dump_failed_payload(payload, 500)
                 raise HTTPException(
                     status_code=500,
-                    detail=classify_responses_error(json.dumps(data)),
+                    detail=detail,
                 )
             return data
         except HTTPException:
