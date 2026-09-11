@@ -9,9 +9,15 @@ ARCHIVE_DIR="logs/failures"
 PIDFILE="/tmp/wgtunnel-proxy.pid"
 # Debounce: upstream rewrites the file on EVERY failed attempt, so without
 # this one 429 incident would rotate every 10s and get us server-side
-# throttled. One rotation per incident, then silence for 5 min.
-COOLDOWN_SECS=300
+# throttled. Adaptive: first 429 in a while rotates fast (60s), repeats
+# back off exponentially (60->120->240->300s cap); 10 quiet minutes reset.
+# A skipped 429 is still archived (consumed), so each NEW file is judged once.
+COOLDOWN_BASE=60
+COOLDOWN_MAX=300
+QUIET_RESET=600
+cooldown=$COOLDOWN_BASE
 next_allowed=0
+last_fire=0
 # Ignore failures that predate the watcher start.
 last=""
 [ -f "$FILE" ] && last=$(stat -c %Y "$FILE")
@@ -35,17 +41,29 @@ while true; do
     if [ "$cur" != "$last" ] && [ "$st" = "429" ]; then
       last="$cur"
       now=$(date +%s)
-      if [ "$now" -ge "$next_allowed" ]; then
-        next_allowed=$((now + COOLDOWN_SECS))
-        if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-          kill -USR1 "$(cat "$PIDFILE")" && echo "$(date '+%F %T'): upstream 429, rotated wgtunnel (cooldown ${COOLDOWN_SECS}s)"
-          archive_handled
-        else
-          echo "$(date '+%F %T'): upstream 429 but wgtunnel proxy not running"
-        fi
-      else
-        echo "$(date '+%F %T'): upstream 429 within cooldown, skipping"
+      # e2e harness artifacts must never rotate real traffic; archive silently.
+      if grep -qi "e2e" "$FILE" 2>/dev/null; then
+        echo "$(date '+%F %T'): e2e test artifact, archiving without rotation"
         archive_handled
+      else
+        if [ $((now - last_fire)) -ge $QUIET_RESET ]; then
+          cooldown=$COOLDOWN_BASE
+        fi
+        if [ "$now" -ge "$next_allowed" ]; then
+          next_allowed=$((now + cooldown))
+          last_fire=$now
+          cooldown=$((cooldown * 2))
+          [ "$cooldown" -gt $COOLDOWN_MAX ] && cooldown=$COOLDOWN_MAX
+          if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+            kill -USR1 "$(cat "$PIDFILE")" && echo "$(date '+%F %T'): upstream 429, rotated wgtunnel (next cooldown ${cooldown}s)"
+            archive_handled
+          else
+            echo "$(date '+%F %T'): upstream 429 but wgtunnel proxy not running"
+          fi
+        else
+          echo "$(date '+%F %T'): upstream 429 within cooldown, skipping"
+          archive_handled
+        fi
       fi
     fi
   fi
