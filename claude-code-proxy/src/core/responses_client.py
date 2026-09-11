@@ -70,16 +70,37 @@ class ResponsesClient:
         return f"{self.base_url}/responses"
 
     @staticmethod
-    def _dump_failed_payload(payload: Dict[str, Any], status: int) -> None:
-        """Save the failing payload locally for diagnosis (no credentials)."""
+    def _dump_failure(
+        status: int,
+        error: str,
+        model: Optional[str] = None,
+        request_id: Optional[str] = None,
+    ) -> None:
+        """Save a compact failure record locally for diagnosis.
+
+        Stores the upstream error text + timestamp first; only a truncated
+        payload summary (never the full prompt) so the dashboard shows the
+        actual error instead of a wall of request text.
+        """
         import os
+        import time as _time
 
         try:
             log_dir = os.environ.get("PROXY_LOG_DIR", "logs")
             os.makedirs(log_dir, exist_ok=True)
             path = os.path.join(log_dir, "last_upstream_failure.json")
             with open(path, "w") as f:
-                json.dump({"status": status, "payload": payload}, f, ensure_ascii=False)
+                json.dump(
+                    {
+                        "status": status,
+                        "error": (error or "")[:2000],
+                        "model": model,
+                        "request_id": request_id,
+                        "at": _time.time(),
+                    },
+                    f,
+                    ensure_ascii=False,
+                )
         except Exception:
             pass
 
@@ -114,10 +135,16 @@ class ResponsesClient:
                     async with httpx.AsyncClient(timeout=self.timeout) as client:
                         resp = await client.post(self._url(), json=payload, headers=self.headers)
                     if resp.status_code >= 400:
-                        self._dump_failed_payload(payload, resp.status_code)
+                        err_text = resp.text
+                        self._dump_failure(
+                            resp.status_code,
+                            err_text,
+                            model=payload.get("model"),
+                            request_id=request_id,
+                        )
                         raise HTTPException(
                             status_code=resp.status_code,
-                            detail=classify_responses_error(resp.text),
+                            detail=classify_responses_error(err_text),
                         )
                     break
                 except HTTPException as e:
@@ -145,9 +172,13 @@ class ResponsesClient:
                     # Upstream HTTP 200 carrying a rate-limit error body
                     # (e.g. FreeUsageLimitError): signal it like an HTTP 429
                     # so the failure watcher rotates the egress peer.
-                    self._dump_failed_payload(payload, 429)
+                    self._dump_failure(
+                        429, err_text, model=payload.get("model"), request_id=request_id
+                    )
                     raise HTTPException(status_code=429, detail=detail)
-                self._dump_failed_payload(payload, 500)
+                self._dump_failure(
+                    500, err_text, model=payload.get("model"), request_id=request_id
+                )
                 raise HTTPException(
                     status_code=500,
                     detail=detail,
@@ -193,12 +224,16 @@ class ResponsesClient:
                         ) as resp:
                             if resp.status_code >= 400:
                                 err_body = await resp.aread()
-                                self._dump_failed_payload(body, resp.status_code)
+                                err_text = err_body.decode("utf-8", "replace")
+                                self._dump_failure(
+                                    resp.status_code,
+                                    err_text,
+                                    model=body.get("model"),
+                                    request_id=request_id,
+                                )
                                 raise HTTPException(
                                     status_code=resp.status_code,
-                                    detail=classify_responses_error(
-                                        err_body.decode("utf-8", "replace")
-                                    ),
+                                    detail=classify_responses_error(err_text),
                                 )
                             event_type: Optional[str] = None
                             data_lines: list = []

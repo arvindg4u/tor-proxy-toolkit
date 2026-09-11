@@ -1,6 +1,8 @@
 from fastapi import APIRouter, HTTPException, Request, Header, Depends
 from fastapi.responses import JSONResponse, StreamingResponse
 from datetime import datetime
+import os
+import time
 import uuid
 import httpx
 from typing import Optional
@@ -9,6 +11,8 @@ from src.core.config import config
 from src.core.logging import logger
 from src.core.client import OpenAIClient
 from src.core.responses_client import ResponsesClient, prime_response_stream
+from src.core.stats import stats
+from src.api.dashboard import dashboard_response
 from src.models.claude import ClaudeMessagesRequest, ClaudeTokenCountRequest
 from src.conversion.request_converter import convert_claude_to_openai
 from src.conversion.request_responses import convert_claude_to_responses
@@ -69,6 +73,8 @@ async def validate_api_key(x_api_key: Optional[str] = Header(None), authorizatio
 
 @router.post("/v1/messages")
 async def create_message(request: ClaudeMessagesRequest, http_request: Request, _: None = Depends(validate_api_key)):
+    t0 = time.monotonic()
+    status = 200
     try:
         logger.debug(
             f"Processing Claude request: model={request.model}, stream={request.stream}"
@@ -81,11 +87,12 @@ async def create_message(request: ClaudeMessagesRequest, http_request: Request, 
         # Spark on OpenCode ZEN): Claude -> Responses -> Claude.
         if config.upstream_wire_api == "responses":
             return await _handle_responses_message(
-                request, http_request, request_id
+                request, http_request, request_id, t0
             )
 
         # Convert Claude request to OpenAI format
         openai_request = convert_claude_to_openai(request, model_manager)
+        stats.note_model(openai_request.get("model"))
 
         # Check if client disconnected before processing
         if await http_request.is_disconnected():
@@ -96,6 +103,11 @@ async def create_message(request: ClaudeMessagesRequest, http_request: Request, 
             try:
                 openai_stream = openai_client.create_chat_completion_stream(
                     openai_request, request_id
+                )
+                stats.record(
+                    "/v1/messages",
+                    status=200,
+                    latency=time.monotonic() - t0,  # accepted; tokens not counted for streams
                 )
                 return StreamingResponse(
                     convert_openai_streaming_to_claude_with_cancellation(
@@ -120,6 +132,7 @@ async def create_message(request: ClaudeMessagesRequest, http_request: Request, 
                 import traceback
 
                 logger.error(traceback.format_exc())
+                status = e.status_code
                 error_message = openai_client.classify_openai_error(e.detail)
                 error_response = {
                     "type": "error",
@@ -134,24 +147,34 @@ async def create_message(request: ClaudeMessagesRequest, http_request: Request, 
             claude_response = convert_openai_to_claude_response(
                 openai_response, request
             )
+            usage = openai_response.get("usage") if isinstance(openai_response, dict) else None
+            stats.record(
+                "/v1/messages",
+                status=200,
+                latency=time.monotonic() - t0,
+                usage=usage,
+            )
             return claude_response
-    except HTTPException:
+    except HTTPException as e:
+        stats.record("/v1/messages", status=e.status_code, latency=time.monotonic() - t0)
         raise
     except Exception as e:
         import traceback
 
         logger.error(f"Unexpected error processing request: {e}")
         logger.error(traceback.format_exc())
+        stats.record("/v1/messages", status=500, latency=time.monotonic() - t0)
         error_message = openai_client.classify_openai_error(str(e))
         raise HTTPException(status_code=500, detail=error_message)
 
 
-async def _handle_responses_message(request: ClaudeMessagesRequest, http_request: Request, request_id: str):
+async def _handle_responses_message(request: ClaudeMessagesRequest, http_request: Request, request_id: str, t0: float):
     """Serve /v1/messages via the Responses API upstream."""
     from src.core.responses_client import classify_responses_error
 
     # Convert Claude request to Responses format
     responses_request = convert_claude_to_responses(request, model_manager)
+    stats.note_model(responses_request.get("model"))
 
     # Check if client disconnected before processing
     if await http_request.is_disconnected():
@@ -166,6 +189,7 @@ async def _handle_responses_message(request: ClaudeMessagesRequest, http_request
             # check now, so an upstream rejection becomes a JSON error
             # instead of a killed stream mid-response.
             responses_stream = await prime_response_stream(responses_stream)
+            stats.record("/v1/messages", status=200, latency=time.monotonic() - t0)
             return StreamingResponse(
                 convert_responses_streaming_to_claude_with_cancellation(
                     responses_stream,
@@ -188,6 +212,7 @@ async def _handle_responses_message(request: ClaudeMessagesRequest, http_request
             import traceback
 
             logger.error(traceback.format_exc())
+            stats.record("/v1/messages", status=e.status_code, latency=time.monotonic() - t0)
             error_message = classify_responses_error(e.detail)
             error_response = {
                 "type": "error",
@@ -198,6 +223,8 @@ async def _handle_responses_message(request: ClaudeMessagesRequest, http_request
         responses_object = await responses_client.create_response(
             responses_request, request_id
         )
+        usage = responses_object.get("usage") if isinstance(responses_object, dict) else None
+        stats.record("/v1/messages", status=200, latency=time.monotonic() - t0, usage=usage)
         return convert_responses_to_claude_response(responses_object, request)
 
 
@@ -382,26 +409,82 @@ async def passthrough_chat_completions(request: Request):
             return JSONResponse(status_code=resp.status_code, content=resp.json())
 
 
+@router.get("/api/status")
+async def api_status():
+    """Machine-readable status for the dashboard (also used by scripts).
+
+    `last_upstream_failure` may be in the legacy shape ({status, payload})
+    from before the compact error-first dump; the dashboard only reads the
+    new shape ({status, error, model, request_id, at}).
+    """
+    last_failure = None
+    failure_history: list = []
+    import glob as _glob
+    import json as _json
+
+    try:
+        log_dir = os.environ.get("PROXY_LOG_DIR", "logs")
+        path = os.path.join(log_dir, "last_upstream_failure.json")
+        if os.path.exists(path):
+            with open(path) as f:
+                last_failure = _json.load(f)
+            if isinstance(last_failure, dict) and "at" not in last_failure:
+                # Legacy dump: no timestamp, no error text. Treat as stale
+                # but keep the status so old watchers still see a 429.
+                last_failure = {
+                    "status": last_failure.get("status"),
+                    "error": "(legacy dump: error text not recorded)",
+                    "model": None,
+                    "request_id": None,
+                    "at": 0,
+                }
+    except Exception:
+        last_failure = None
+    try:
+        arch = sorted(
+            _glob.glob(os.path.join(log_dir, "failures", "failure-*.json")),
+            reverse=True,
+        )[:20]
+        for ap in arch:
+            try:
+                with open(ap) as f:
+                    d = _json.load(f)
+                if isinstance(d, dict):
+                    failure_history.append(
+                        {
+                            "status": d.get("status"),
+                            "error": str(d.get("error", ""))[:300],
+                            "model": d.get("model"),
+                            "at": d.get("at", 0),
+                        }
+                    )
+            except Exception:
+                continue
+    except Exception:
+        failure_history = []
+    return {
+        "proxy": {
+            "openai_base_url": config.openai_base_url,
+            "wire_api": config.upstream_wire_api,
+            "upstream_user_agent": config.upstream_user_agent,
+            "max_tokens_limit": config.max_tokens_limit,
+            "request_timeout": config.request_timeout,
+            "retry_budget_secs": config.responses_retry_budget_secs,
+            "keepalive_secs": config.stream_keepalive_secs,
+            "client_key_validation": bool(config.anthropic_api_key),
+            "models": {
+                "big": config.big_model,
+                "middle": config.middle_model,
+                "small": config.small_model,
+            },
+        },
+        "stats": stats.snapshot(),
+        "last_upstream_failure": last_failure,
+        "failure_history": failure_history,
+    }
+
+
 @router.get("/")
 async def root():
-    """Root endpoint"""
-    return {
-        "message": "Claude-to-OpenAI API Proxy v1.0.0",
-        "status": "running",
-        "config": {
-            "openai_base_url": config.openai_base_url,
-            "max_tokens_limit": config.max_tokens_limit,
-            "api_key_configured": bool(config.openai_api_key),
-            "client_api_key_validation": bool(config.anthropic_api_key),
-            "big_model": config.big_model,
-            "small_model": config.small_model,
-        },
-        "endpoints": {
-            "messages": "/v1/messages",
-            "responses": "/v1/responses",
-            "chat_completions": "/v1/chat/completions",
-            "count_tokens": "/v1/messages/count_tokens",
-            "health": "/health",
-            "test_connection": "/test-connection",
-        },
-    }
+    """Native status dashboard (HTML). JSON moved to /api/status."""
+    return dashboard_response()
