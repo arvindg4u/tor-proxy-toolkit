@@ -81,19 +81,13 @@ def convert_claude_to_responses(
             responses_request["tools"] = responses_tools
 
     # Tool choice
+    # Tool choice: this upstream accepts ONLY "auto" — "none",
+    # "required" and named-function choices all 400 with
+    # param=tool_choice. So everything maps to "auto" (forcing/no-tools
+    # semantics cannot be expressed; sending them would hard-fail the
+    # request instead).
     if claude_request.tool_choice:
-        choice_type = claude_request.tool_choice.get("type")
-        if choice_type == "auto":
-            responses_request["tool_choice"] = "auto"
-        elif choice_type == "any":
-            responses_request["tool_choice"] = "required"
-        elif choice_type == "none":
-            responses_request["tool_choice"] = "none"
-        elif choice_type == "tool" and "name" in claude_request.tool_choice:
-            responses_request["tool_choice"] = {
-                "type": Constants.TOOL_FUNCTION,
-                "name": claude_request.tool_choice["name"],
-            }
+        responses_request["tool_choice"] = "auto"
 
     logger.debug(
         "Converted Claude request to Responses format: %s",
