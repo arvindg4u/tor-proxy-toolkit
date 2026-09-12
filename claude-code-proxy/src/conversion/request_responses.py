@@ -13,7 +13,6 @@ from typing import Any, Dict, List
 from src.core.constants import Constants
 from src.core.config import config
 from src.models.claude import ClaudeMessagesRequest, ClaudeMessage
-from src.conversion.request_converter import parse_tool_result_content
 
 logger = logging.getLogger(__name__)
 
@@ -174,6 +173,89 @@ def _user_text_item(text: str) -> Dict[str, Any]:
     }
 
 
+def _image_block_to_input_part(block) -> Dict[str, Any] | None:
+    """Convert a Claude image content block to a Responses input part.
+
+    Accepts both pydantic blocks and plain dicts. Returns None when the
+    block carries no usable image payload.
+    """
+    source = block.source if hasattr(block, "source") else block.get("source", {})
+    if not isinstance(source, dict):
+        return None
+    stype = source.get("type")
+    if stype == "base64":
+        data = source.get("data", "")
+        if not data:
+            return None
+        media_type = source.get("media_type") or _sniff_media_type(data)
+        return {
+            "type": "input_image",
+            "image_url": f"data:{media_type};base64,{data}",
+        }
+    if stype == "url":
+        url = source.get("url", "")
+        if not url:
+            return None
+        return {"type": "input_image", "image_url": url}
+    return None
+
+
+def _sniff_media_type(b64: str) -> str:
+    """Best-effort media type for base64 image data missing `media_type`.
+
+    Claude clients sometimes send image blocks without `media_type`
+    (seen in tool_result payloads); the upstream rejects the request
+    when the data URL has no usable MIME type, so sniff the magic bytes.
+    """
+    head = (b64 or "").lstrip()[:16]
+    if head.startswith("/9j/"):
+        return "image/jpeg"
+    if head.startswith("iVBOR"):
+        return "image/png"
+    if head.startswith("R0lGOD"):
+        return "image/gif"
+    if head.startswith("UklGR"):
+        return "image/webp"
+    return "image/jpeg"
+
+
+def _tool_result_text_and_images(raw) -> tuple[str, List[Dict[str, Any]]]:
+    """Split tool_result content into text plus image input parts.
+
+    Image blocks inside tool results must NOT be JSON-dumped into the
+    `function_call_output.output` string (the upstream rejects that with
+    `invalid_request_error`); they become `input_image` parts instead.
+    """
+    texts: List[str] = []
+    images: List[Dict[str, Any]] = []
+    items = raw if isinstance(raw, list) else [raw]
+    for item in items:
+        if isinstance(item, str):
+            texts.append(item)
+            continue
+        if not isinstance(item, dict):
+            try:
+                texts.append(json.dumps(item, ensure_ascii=False))
+            except Exception:
+                texts.append(str(item))
+            continue
+        itype = item.get("type")
+        if itype == Constants.CONTENT_IMAGE:
+            part = _image_block_to_input_part(item)
+            if part is not None:
+                images.append(part)
+        elif itype == Constants.CONTENT_TEXT:
+            texts.append(item.get("text", ""))
+        elif "text" in item:
+            texts.append(item.get("text", ""))
+        else:
+            try:
+                texts.append(json.dumps(item, ensure_ascii=False))
+            except Exception:
+                texts.append(str(item))
+    return "\n".join(texts).strip(), images
+
+
 def _convert_user_message(msg: ClaudeMessage) -> List[Dict[str, Any]]:
     """User message -> user message item + function_call_output items.
 
@@ -190,25 +272,16 @@ def _convert_user_message(msg: ClaudeMessage) -> List[Dict[str, Any]]:
         return [_user_text_item(content)]
 
     text_parts: List[Dict[str, Any]] = []
+    pending_images: List[Dict[str, Any]] = []
     for block in content:
         btype = block.type if hasattr(block, "type") else block.get("type")
         if btype == Constants.CONTENT_TEXT:
             text = block.text if hasattr(block, "text") else block.get("text", "")
             text_parts.append({"type": "input_text", "text": text})
         elif btype == Constants.CONTENT_IMAGE:
-            source = block.source if hasattr(block, "source") else block.get("source", {})
-            if (
-                isinstance(source, dict)
-                and source.get("type") == "base64"
-                and "media_type" in source
-                and "data" in source
-            ):
-                text_parts.append(
-                    {
-                        "type": "input_image",
-                        "image_url": f"data:{source['media_type']};base64,{source['data']}",
-                    }
-                )
+            part = _image_block_to_input_part(block)
+            if part is not None:
+                text_parts.append(part)
         elif btype == Constants.CONTENT_TOOL_RESULT:
             tool_use_id = (
                 block.tool_use_id
@@ -216,13 +289,15 @@ def _convert_user_message(msg: ClaudeMessage) -> List[Dict[str, Any]]:
                 else block.get("tool_use_id", "")
             )
             raw = block.content if hasattr(block, "content") else block.get("content")
+            text, images = _tool_result_text_and_images(raw)
             items.append(
                 {
                     "type": "function_call_output",
                     "call_id": tool_use_id,
-                    "output": parse_tool_result_content(raw),
+                    "output": text or "No content provided",
                 }
             )
+            pending_images.extend(images)
     if text_parts:
         items.append(
             {
@@ -231,6 +306,22 @@ def _convert_user_message(msg: ClaudeMessage) -> List[Dict[str, Any]]:
                 "content": text_parts,
             }
         )
+    if pending_images:
+        # Images returned inside tool results ride along as their own
+        # message item right after the outputs (never inside the
+        # output string, and never between a function_call and its
+        # output — outputs were already emitted above).
+        items.append(
+            {
+                "type": "message",
+                "role": Constants.ROLE_USER,
+                "content": pending_images,
+            }
+        )
+    if not items:
+        # Upstream rejects `input: []` with invalid_request_error, so an
+        # image-only message whose image was unusable still sends text.
+        items.append(_user_text_item(""))
     return items
 
 
