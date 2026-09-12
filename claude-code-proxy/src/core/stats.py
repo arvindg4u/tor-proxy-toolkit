@@ -24,6 +24,7 @@ class ProxyStats:
         self.by_status: Dict[str, int] = {}
         self.tokens_in = 0
         self.tokens_out = 0
+        self.tokens_cached = 0
         self.latency_sum = 0.0
         self.latency_count = 0
         self.last_error_at: Optional[float] = None
@@ -57,6 +58,11 @@ class ProxyStats:
                 self.tokens_out += int(
                     usage.get("completion_tokens") or usage.get("output_tokens") or 0
                 )
+                self.tokens_cached += int(
+                    usage.get("cache_read_input_tokens", 0)
+                    or (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
+                    or (usage.get("input_tokens_details") or {}).get("cached_tokens", 0)
+                )
 
     def note_model(self, model: Optional[str]):
         """Count a request against a model name (endpoint counting happens elsewhere)."""
@@ -74,6 +80,11 @@ class ProxyStats:
             self.tokens_out += int(
                 usage.get("completion_tokens") or usage.get("output_tokens") or 0
             )
+            self.tokens_cached += int(
+                usage.get("cache_read_input_tokens", 0)
+                or (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
+                or (usage.get("input_tokens_details") or {}).get("cached_tokens", 0)
+            )
 
     def snapshot(self) -> Dict[str, Any]:
         """Return a JSON-serializable copy of all counters."""
@@ -90,6 +101,7 @@ class ProxyStats:
                 "avg_latency_ms": round(avg_latency * 1000, 1),
                 "tokens_in": self.tokens_in,
                 "tokens_out": self.tokens_out,
+                "tokens_cached": self.tokens_cached,
                 "by_endpoint": dict(self.by_endpoint),
                 "by_model": dict(self.by_model),
                 "by_status": dict(self.by_status),

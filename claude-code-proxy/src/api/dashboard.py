@@ -186,7 +186,8 @@ async function tick(){
     +row('Max tokens limit',fmtN(p.max_tokens_limit))
     +row('Request timeout',p.request_timeout+'s')
     +row('Avg latency',s.avg_latency_ms+' ms')
-    +row('Tokens in / out',fmtN(s.tokens_in)+' / '+fmtN(s.tokens_out));
+    +row('Tokens in / out',fmtN(s.tokens_in)+' / '+fmtN(s.tokens_out))
+    +row('Tokens cached',fmtN(s.tokens_cached||0)+' ('+(s.tokens_in?Math.round((s.tokens_cached||0)/s.tokens_in*100):0)+'% of in)');
   $('tr-rows').innerHTML=row('Total requests',fmtN(s.total_requests))
     +row('OK',fmtN(s.ok_requests))+row('Errors',fmtN(s.errors))
     +row('Error rate',(s.error_rate*100).toFixed(1)+'%')

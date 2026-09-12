@@ -9,6 +9,7 @@ from fastapi import HTTPException, Request
 
 from src.core.config import config
 from src.core.constants import Constants
+from src.core.stats import stats
 from src.models.claude import ClaudeMessagesRequest
 
 
@@ -69,6 +70,13 @@ def convert_responses_to_claude_response(
         "usage": {
             "input_tokens": usage.get("input_tokens", 0),
             "output_tokens": usage.get("output_tokens", 0),
+            # Upstream prompt cache hits (implicit prefix-match caching):
+            # surface them so Claude Code sees real cache performance
+            # instead of assuming zero caching.
+            "cache_read_input_tokens": (usage.get("input_tokens_details") or {}).get(
+                "cached_tokens", 0
+            ),
+            "cache_creation_input_tokens": 0,
         },
     }
     return claude_response
@@ -143,7 +151,12 @@ async def convert_responses_streaming_to_claude_with_cancellation(
     # item_id -> {"claude_index", "id", "name", "args_buffer", "started", "done_sent"}
     function_calls: Dict[str, Dict[str, Any]] = {}
     has_function_call = False
-    usage_data = {"input_tokens": 0, "output_tokens": 0}
+    usage_data = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+    }
     final_status: str = "completed"
     incomplete_reason: str = ""
 
@@ -293,6 +306,10 @@ async def convert_responses_streaming_to_claude_with_cancellation(
                 usage_data = {
                     "input_tokens": usage.get("input_tokens", 0),
                     "output_tokens": usage.get("output_tokens", 0),
+                    "cache_read_input_tokens": (
+                        usage.get("input_tokens_details") or {}
+                    ).get("cached_tokens", 0),
+                    "cache_creation_input_tokens": 0,
                 }
                 for item in response.get("output", []) or []:
                     if isinstance(item, dict) and item.get("type") == "function_call":
@@ -333,6 +350,10 @@ async def convert_responses_streaming_to_claude_with_cancellation(
     for task in (pump_task, keepalive_task):
         if not task.done():
             task.cancel()
+
+    # Streaming requests only count hits in endpoints.py — feed the final
+    # usage (incl. cache hits) into stats here so tokens aren't invisible.
+    stats.add_tokens(usage_data)
 
     # Flush any function call that never got an explicit done event.
     for entry in function_calls.values():
