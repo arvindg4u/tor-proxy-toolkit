@@ -3,6 +3,7 @@ from typing import Dict, Any, List
 from venv import logger
 from src.core.constants import Constants
 from src.models.claude import ClaudeMessagesRequest, ClaudeMessage
+from src.conversion.tool_names import to_upstream_name
 from src.core.config import config
 import logging
 
@@ -129,7 +130,9 @@ def convert_claude_to_openai(
                     {
                         "type": Constants.TOOL_FUNCTION,
                         Constants.TOOL_FUNCTION: {
-                            "name": tool.name,
+                            # Upstream rejects `name` > 64 chars: alias it
+                            # and map back on the response path.
+                            "name": to_upstream_name(tool.name),
                             "description": tool.description or "",
                             "parameters": tool.input_schema,
                         },
@@ -148,7 +151,9 @@ def convert_claude_to_openai(
         elif choice_type == "tool" and "name" in claude_request.tool_choice:
             openai_request["tool_choice"] = {
                 "type": Constants.TOOL_FUNCTION,
-                Constants.TOOL_FUNCTION: {"name": claude_request.tool_choice["name"]},
+                Constants.TOOL_FUNCTION: {
+                    "name": to_upstream_name(claude_request.tool_choice["name"])
+                },
             }
         else:
             openai_request["tool_choice"] = "auto"
@@ -212,7 +217,9 @@ def convert_claude_assistant_message(msg: ClaudeMessage) -> Dict[str, Any]:
                     "id": block.id,
                     "type": Constants.TOOL_FUNCTION,
                     Constants.TOOL_FUNCTION: {
-                        "name": block.name,
+                        # History replay: prior tool_use names must use the
+                        # same upstream alias as the declared tools.
+                        "name": to_upstream_name(block.name),
                         "arguments": json.dumps(block.input, ensure_ascii=False),
                     },
                 }

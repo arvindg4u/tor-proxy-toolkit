@@ -12,6 +12,7 @@ from typing import Any, Dict, List
 
 from src.core.constants import Constants
 from src.core.config import config
+from src.conversion.tool_names import to_upstream_name
 from src.models.claude import ClaudeMessagesRequest, ClaudeMessage
 
 logger = logging.getLogger(__name__)
@@ -56,7 +57,13 @@ def convert_claude_to_responses(
     # Thinking -> reasoning effort (Muse Spark accepts low/medium/high/xhigh)
     effort = _map_thinking_to_effort(claude_request)
     if effort is not None:
-        responses_request["reasoning"] = {"effort": effort}
+        reasoning: Dict[str, Any] = {"effort": effort}
+        thinking_cfg = claude_request.thinking
+        if thinking_cfg is not None and thinking_cfg.type == "enabled":
+            # Summaries are opt-in upstream; without this the reasoning
+            # phase streams nothing and long turns arrive in one shot.
+            reasoning["summary"] = "auto"
+        responses_request["reasoning"] = reasoning
 
     # Tools: flatten to function tools (ZEN/Muse Spark rejects
     # custom/namespace tool types — same fix as mimo2codex).
@@ -72,7 +79,9 @@ def convert_claude_to_responses(
                 responses_tools.append(
                     {
                         "type": Constants.TOOL_FUNCTION,
-                        "name": tool.name,
+                        # Upstream rejects `name` > 64 chars: alias it and
+                        # map back on the response path.
+                        "name": to_upstream_name(tool.name),
                         "description": tool.description or "",
                         "parameters": parameters,
                     }
@@ -351,7 +360,9 @@ def _convert_assistant_message(msg: ClaudeMessage) -> List[Dict[str, Any]]:
                 {
                     "type": "function_call",
                     "call_id": bid,
-                    "name": name,
+                    # History replay: prior tool_use names must use the same
+                    # upstream alias as the declared tools.
+                    "name": to_upstream_name(name),
                     "arguments": json.dumps(binput or {}, ensure_ascii=False),
                 }
             )

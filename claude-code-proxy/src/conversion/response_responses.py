@@ -10,6 +10,7 @@ from fastapi import HTTPException, Request
 
 from src.core.config import config
 from src.core.constants import Constants
+from src.conversion.tool_names import from_upstream_name
 from src.core.stats import stats
 from src.models.claude import ClaudeMessagesRequest
 
@@ -22,10 +23,23 @@ def convert_responses_to_claude_response(
 
     content_blocks: List[Dict[str, Any]] = []
     has_function_call = False
+    thinking_texts: List[str] = []
+    thinking_cfg = getattr(original_request, "thinking", None)
+    want_thinking = bool(
+        thinking_cfg is not None and thinking_cfg.type == "enabled"
+    )
     for item in output:
         if not isinstance(item, dict):
             continue
         itype = item.get("type")
+        if itype == "reasoning":
+            if want_thinking:
+                for part in item.get("summary", []) or []:
+                    if isinstance(part, dict) and part.get("type") == "summary_text":
+                        text = part.get("text", "")
+                        if text:
+                            thinking_texts.append(text)
+            continue
         if itype == "message":
             for part in item.get("content", []) or []:
                 if not isinstance(part, dict):
@@ -47,12 +61,24 @@ def convert_responses_to_claude_response(
                 {
                     "type": Constants.CONTENT_TOOL_USE,
                     "id": item.get("call_id") or item.get("id") or f"toolu_{uuid.uuid4().hex[:24]}",
-                    "name": item.get("name", ""),
+                    # Upstream echoes our alias: restore the Claude-side name.
+                    "name": from_upstream_name(item.get("name", "")),
                     "input": _parse_arguments(item.get("arguments")),
                 }
             )
         # "reasoning" items carry opaque encrypted_content: not translatable
-        # to Claude thinking blocks, so they are intentionally skipped.
+        # to Claude thinking blocks, so they are intentionally skipped
+        # (summaries collected above).
+
+    if thinking_texts:
+        content_blocks.insert(
+            0,
+            {
+                "type": Constants.CONTENT_THINKING,
+                "thinking": "\n\n".join(thinking_texts),
+                "signature": "",
+            },
+        )
 
     if not content_blocks:
         content_blocks.append({"type": Constants.CONTENT_TEXT, "text": ""})
@@ -171,6 +197,15 @@ async def convert_responses_streaming_to_claude_with_cancellation(
     # upstream); adopted when the added event arrives, dropped at the end.
     pending_args: Dict[str, str] = {}
     has_function_call = False
+    # Thinking display: when the Claude request enabled thinking, upstream
+    # reasoning summaries stream as a Claude thinking block so long
+    # reasoning phases are visible (and count live) instead of arriving as
+    # one silent gap. Opt-in upstream via reasoning.summary="auto"
+    # (request_responses.py); without it the upstream sends no summaries.
+    thinking = getattr(original_request, "thinking", None)
+    want_thinking = bool(thinking is not None and thinking.type == "enabled")
+    thinking_index: int | None = None
+    thinking_open = False
     usage_data = {
         "input_tokens": 0,
         "output_tokens": 0,
@@ -277,6 +312,54 @@ async def convert_responses_streaming_to_claude_with_cancellation(
                             "delta": {"type": Constants.DELTA_TEXT, "text": delta},
                         },
                     )
+            elif event_type == "response.reasoning_summary_part.added":
+                if want_thinking and not thinking_open:
+                    tool_block_counter += 1
+                    thinking_index = text_block_index + tool_block_counter
+                    thinking_open = True
+                    yield _sse(
+                        Constants.EVENT_CONTENT_BLOCK_START,
+                        {
+                            "type": Constants.EVENT_CONTENT_BLOCK_START,
+                            "index": thinking_index,
+                            "content_block": {
+                                "type": Constants.CONTENT_THINKING,
+                                "thinking": "",
+                                "signature": "",
+                            },
+                        },
+                    )
+            elif event_type == "response.reasoning_summary_text.delta":
+                delta = payload.get("delta")
+                if want_thinking and delta:
+                    if not thinking_open:
+                        # Defensive: some upstreams skip part.added.
+                        tool_block_counter += 1
+                        thinking_index = text_block_index + tool_block_counter
+                        thinking_open = True
+                        yield _sse(
+                            Constants.EVENT_CONTENT_BLOCK_START,
+                            {
+                                "type": Constants.EVENT_CONTENT_BLOCK_START,
+                                "index": thinking_index,
+                                "content_block": {
+                                    "type": Constants.CONTENT_THINKING,
+                                    "thinking": "",
+                                    "signature": "",
+                                },
+                            },
+                        )
+                    yield _sse(
+                        Constants.EVENT_CONTENT_BLOCK_DELTA,
+                        {
+                            "type": Constants.EVENT_CONTENT_BLOCK_DELTA,
+                            "index": thinking_index,
+                            "delta": {
+                                "type": Constants.DELTA_THINKING,
+                                "thinking": delta,
+                            },
+                        },
+                    )
             elif event_type == "response.output_item.added":
                 item = payload.get("item", {}) or {}
                 if item.get("type") == "function_call":
@@ -290,7 +373,8 @@ async def convert_responses_streaming_to_claude_with_cancellation(
                     function_calls[item_id] = {
                         "claude_index": claude_index,
                         "id": item.get("call_id") or item.get("id") or item_id,
-                        "name": item.get("name", ""),
+                        # Upstream echoes our alias: restore the Claude-side name.
+                        "name": from_upstream_name(item.get("name", "")),
                         "args_buffer": "",
                         "sent_len": 0,
                         "started": True,
@@ -372,6 +456,28 @@ async def convert_responses_streaming_to_claude_with_cancellation(
             ):
                 item = payload.get("item") if event_type == "response.output_item.done" else None
                 if event_type == "response.output_item.done":
+                    if isinstance(item, dict) and item.get("type") == "reasoning":
+                        if thinking_open:
+                            yield _sse(
+                                Constants.EVENT_CONTENT_BLOCK_DELTA,
+                                {
+                                    "type": Constants.EVENT_CONTENT_BLOCK_DELTA,
+                                    "index": thinking_index,
+                                    "delta": {
+                                        "type": Constants.DELTA_SIGNATURE,
+                                        "signature": "",
+                                    },
+                                },
+                            )
+                            yield _sse(
+                                Constants.EVENT_CONTENT_BLOCK_STOP,
+                                {
+                                    "type": Constants.EVENT_CONTENT_BLOCK_STOP,
+                                    "index": thinking_index,
+                                },
+                            )
+                            thinking_open = False
+                        continue
                     if not isinstance(item, dict) or item.get("type") != "function_call":
                         continue
                     item_id = item.get("id") or item.get("call_id", "")
@@ -383,7 +489,7 @@ async def convert_responses_streaming_to_claude_with_cancellation(
                     ):
                         entry["args_buffer"] = item["arguments"]
                     if item.get("name"):
-                        entry["name"] = item["name"]
+                        entry["name"] = from_upstream_name(item["name"])
                 else:
                     item_id = payload.get("item_id", "")
                     entry = function_calls.get(item_id)
@@ -540,6 +646,22 @@ async def convert_responses_streaming_to_claude_with_cancellation(
         Constants.EVENT_CONTENT_BLOCK_STOP,
         {"type": Constants.EVENT_CONTENT_BLOCK_STOP, "index": text_block_index},
     )
+    if thinking_open:
+        # Safety net: reasoning item done never arrived (e.g. upstream
+        # only sent summary deltas). Never leave the block dangling.
+        yield _sse(
+            Constants.EVENT_CONTENT_BLOCK_DELTA,
+            {
+                "type": Constants.EVENT_CONTENT_BLOCK_DELTA,
+                "index": thinking_index,
+                "delta": {"type": Constants.DELTA_SIGNATURE, "signature": ""},
+            },
+        )
+        yield _sse(
+            Constants.EVENT_CONTENT_BLOCK_STOP,
+            {"type": Constants.EVENT_CONTENT_BLOCK_STOP, "index": thinking_index},
+        )
+        thinking_open = False
     for entry in function_calls.values():
         if entry.get("started"):
             yield _sse(

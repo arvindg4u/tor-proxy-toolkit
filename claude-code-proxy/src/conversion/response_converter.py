@@ -3,6 +3,7 @@ import time
 import uuid
 from fastapi import HTTPException, Request
 from src.core.constants import Constants
+from src.conversion.tool_names import from_upstream_name
 from src.core.stats import stats
 from src.models.claude import ClaudeMessagesRequest
 
@@ -73,7 +74,8 @@ def convert_openai_to_claude_response(
                 {
                     "type": Constants.CONTENT_TOOL_USE,
                     "id": tool_call.get("id", f"tool_{uuid.uuid4()}"),
-                    "name": function_data.get("name", ""),
+                    # Upstream echoes our alias: restore the Claude-side name.
+                    "name": from_upstream_name(function_data.get("name", "")),
                     "input": arguments,
                 }
             )
@@ -175,7 +177,8 @@ async def convert_openai_streaming_to_claude(
                     # Update function name and start content block if we have both id and name
                     function_data = tc_delta.get(Constants.TOOL_FUNCTION) or {}
                     if function_data.get("name"):
-                        tool_call["name"] = function_data["name"]
+                        # Upstream echoes our alias: restore the Claude-side name.
+                        tool_call["name"] = from_upstream_name(function_data["name"])
 
                     # Start content block when we have complete initial data
                     if (tool_call["id"] and tool_call["name"] and not tool_call["started"]):
@@ -352,7 +355,8 @@ async def convert_openai_streaming_to_claude_with_cancellation(
                     # Update function name and start content block if we have both id and name
                     function_data = tc_delta.get(Constants.TOOL_FUNCTION) or {}
                     if function_data.get("name"):
-                        tool_call["name"] = function_data["name"]
+                        # Upstream echoes our alias: restore the Claude-side name.
+                        tool_call["name"] = from_upstream_name(function_data["name"])
 
                     # Start content block when we have complete initial data
                     if (tool_call["id"] and tool_call["name"] and not tool_call["started"]):
