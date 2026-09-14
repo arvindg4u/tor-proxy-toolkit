@@ -98,6 +98,12 @@ start_claude_proxy() {
     info "Starting Claude Code Proxy on port $CLAUDE_PROXY_PORT..."
     cd "$SCRIPT_DIR/claude-code-proxy"
 
+    # Python deps (no-op when already installed — makes fresh VPS work)
+    if ! python3 -c "import fastapi, openai, httpx, uvicorn" 2>/dev/null; then
+        info "Installing Claude proxy Python deps..."
+        pip3 install --break-system-packages -r requirements.txt 2>/dev/null || pip3 install -r requirements.txt
+    fi
+
     export OPENAI_API_KEY="${OPENAI_API_KEY:-sk-dummy}"
     export OPENAI_BASE_URL="${OPENAI_BASE_URL:-https://opencode.ai/zen/v1}"
     export BIG_MODEL="${BIG_MODEL:-x-preview-f-free}"

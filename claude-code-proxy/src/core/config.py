@@ -97,9 +97,11 @@ class Config:
         # If no ANTHROPIC_API_KEY is set in environment, skip validation
         if not self.anthropic_api_key:
             return True
-            
+
         # Check if the client's API key matches the expected value
-        return client_api_key == self.anthropic_api_key
+        import hmac
+
+        return hmac.compare_digest(str(client_api_key), str(self.anthropic_api_key))
     
     def get_custom_headers(self):
         """Get custom headers from environment variables"""

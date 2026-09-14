@@ -170,6 +170,7 @@ async function tick(){
   let d;
   try{const r=await fetch('/api/status');d=await r.json();}
   catch(e){$('dot').className='dot bad';$('live-label').textContent='unreachable';return;}
+  if(!d||!d.proxy||!d.stats){$('dot').className='dot bad';$('live-label').textContent='bad status';return;}
   const p=d.proxy,s=d.stats;
   const errAge=s.last_error_at?((Date.now()/1000)-s.last_error_at):null; // secs since last failed request
   const failAge=d.last_upstream_failure&&d.last_upstream_failure.at?((Date.now()/1000)-d.last_upstream_failure.at):null;
@@ -186,12 +187,17 @@ async function tick(){
     +row('Max tokens limit',fmtN(p.max_tokens_limit))
     +row('Request timeout',p.request_timeout+'s')
     +row('Avg latency',s.avg_latency_ms+' ms')
+    +row('TTFT p50 / p95',(s.ttft_ms?s.ttft_ms.p50_ms+' / '+s.ttft_ms.p95_ms+' ms':'—'))
+    +row('ITL p50',(s.itl_ms?s.itl_ms.p50_ms+' ms':'—'))
+    +row('Streams',fmtN(s.streams||0)+' · keepalives '+fmtN(s.keepalive_sent||0))
     +row('Tokens in / out',fmtN(s.tokens_in)+' / '+fmtN(s.tokens_out))
     +row('Tokens cached',fmtN(s.tokens_cached||0)+' ('+(s.tokens_in?Math.round((s.tokens_cached||0)/s.tokens_in*100):0)+'% of in)');
   $('tr-rows').innerHTML=row('Total requests',fmtN(s.total_requests))
     +row('OK',fmtN(s.ok_requests))+row('Errors',fmtN(s.errors))
     +row('Error rate',(s.error_rate*100).toFixed(1)+'%')
-    +row('Avg latency',s.avg_latency_ms+' ms');
+    +row('Avg latency',s.avg_latency_ms+' ms')
+    +row('TTFT avg',(s.ttft_ms?s.ttft_ms.avg_ms+' ms (n='+s.ttft_ms.count+')':'—'))
+    +row('Keepalives sent',fmtN(s.keepalive_sent||0));
   dist($('tr-status'),s.by_status,s.total_requests);
   dist($('tr-ep'),s.by_endpoint,s.total_requests);
   $('mo-map').innerHTML=row('big (opus)',p.models.big,1)+row('middle (sonnet)',p.models.middle,1)+row('small (haiku)',p.models.small,1);

@@ -20,6 +20,14 @@ case "${1:-status}" in
         export PORT=4013
         export LOG_LEVEL="WARNING"
         export MAX_TOKENS_LIMIT="128000"
+        # Studio-local vendored deps (pool sandbox: no venvs allowed). On a
+        # normal machine this dir doesn't exist — harmless, requirements.txt
+        # covers it. Kept conditional so one script works everywhere.
+        if [ -d "$SCRIPT_DIR/.libs" ]; then
+            export PYTHONPATH="$SCRIPT_DIR/.libs${PYTHONPATH:+:$PYTHONPATH}"
+        fi
+        # Direct upstream: never route via WG tunnel.
+        unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy
         mkdir -p "$LOG_DIR" "$PID_DIR"
         python3 start_proxy.py > "$LOG_DIR/claude-proxy.log" 2>&1 &
         echo $! > "$PID_DIR/claude-proxy.pid"

@@ -4,6 +4,8 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+# Studio-local vendored deps (sandbox only; VPS installs requirements.txt)
+.libs/
 
 # Environment
 .env
@@ -12,6 +14,8 @@ venv/
 # Logs
 *.log
 /var/log/
+# Proxy runtime failure dumps (may echo upstream error text)
+claude-code-proxy/logs/
 
 # PID files
 /tmp/

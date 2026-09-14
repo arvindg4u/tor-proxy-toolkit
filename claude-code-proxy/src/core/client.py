@@ -1,5 +1,4 @@
 import asyncio
-import json
 from fastapi import HTTPException
 from typing import Optional, AsyncGenerator, Dict, Any
 from openai import AsyncOpenAI, AsyncAzureOpenAI
@@ -100,8 +99,13 @@ class OpenAIClient:
             if request_id and request_id in self.active_requests:
                 del self.active_requests[request_id]
     
-    async def create_chat_completion_stream(self, request: Dict[str, Any], request_id: Optional[str] = None) -> AsyncGenerator[str, None]:
-        """Send streaming chat completion to OpenAI API with cancellation support."""
+    async def create_chat_completion_stream(self, request: Dict[str, Any], request_id: Optional[str] = None) -> AsyncGenerator[Dict[str, Any], None]:
+        """Send streaming chat completion to OpenAI API with cancellation support.
+
+        Phase 3: yields decoded chunk dicts (``{"type": "chunk", "chunk": {...}}``,
+        ``{"type": "done"}``) instead of pre-serialized ``"data: ..."`` strings,
+        so the converter serializes exactly once at the SSE boundary.
+        """
         
         # Create cancellation token if request_id provided
         if request_id:
@@ -124,13 +128,13 @@ class OpenAIClient:
                     if self.active_requests[request_id].is_set():
                         raise HTTPException(status_code=499, detail="Request cancelled by client")
                 
-                # Convert chunk to SSE format matching original HTTP client format
+                # Convert chunk to a decoded dict (no JSON round-trip here;
+                # the converter serializes once at the SSE boundary).
                 chunk_dict = chunk.model_dump()
-                chunk_json = json.dumps(chunk_dict, ensure_ascii=False)
-                yield f"data: {chunk_json}"
-            
+                yield {"type": "chunk", "chunk": chunk_dict}
+
             # Signal end of stream
-            yield "data: [DONE]"
+            yield {"type": "done"}
                 
         except AuthenticationError as e:
             raise HTTPException(status_code=401, detail=self.classify_openai_error(str(e)))

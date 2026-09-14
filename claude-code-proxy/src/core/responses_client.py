@@ -8,6 +8,9 @@ from typing import Any, AsyncGenerator, Dict, Optional
 import httpx
 from fastapi import HTTPException
 
+from src.core.guards import scrub_api_keys
+from src.core.http_client import get_shared_client, get_stream_timeout
+
 logger = logging.getLogger(__name__)
 
 
@@ -39,6 +42,54 @@ def classify_responses_error(error_detail: Any) -> str:
     if "unavailable" in error_str:
         return "Model is temporarily unavailable upstream. Retry or pick another free model."
     return str(error_detail)
+
+
+def _extract_sse_events(buffer: bytearray) -> "list[str]":
+    """Pop complete SSE events (blank-line delimited) off a byte buffer.
+
+    Phase 3: split framing on raw bytes (``b"\\n\\n"`` boundaries are ASCII,
+    so a split can never cut a multi-byte UTF-8 sequence) and decode one
+    complete event at a time. A trailing partial event stays buffered.
+    CRLF is normalized on the accumulated buffer, so a ``\\r\\n`` split
+    across two TCP chunks still frames. Returns decoded, non-blank events.
+    """
+    if b"\r" in buffer:
+        # Hold back a trailing CR: it may be the first half of a CRLF
+        # split across two TCP chunks (converting it now would plant a
+        # phantom blank line when the LF arrives). The end-of-stream flush
+        # handles a genuinely trailing CR.
+        trailing_cr = buffer.endswith(b"\r")
+        if trailing_cr:
+            del buffer[-1:]
+        buffer[:] = buffer.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+        if trailing_cr:
+            buffer += b"\r"
+    events = []
+    while True:
+        idx = buffer.find(b"\n\n")
+        if idx < 0:
+            break
+        raw = bytes(buffer[:idx])
+        del buffer[: idx + 2]
+        text = raw.decode("utf-8", "replace")
+        if text.strip():
+            events.append(text)
+    return events
+
+
+def _parse_sse_event(text: str):
+    """Split one raw SSE event text into (event_type, data_str|None)."""
+    event_type: Optional[str] = None
+    data_lines: "list[str]" = []
+    for line in text.split("\n"):
+        if line.startswith("event:"):
+            event_type = line[6:].strip()
+        elif line.startswith("data:"):
+            data_lines.append(line[5:].strip())
+        # ignore ":" comments and other fields
+    if event_type is None and not data_lines:
+        return "message", None
+    return event_type or "message", "\n".join(data_lines)
 
 
 class ResponsesClient:
@@ -93,7 +144,7 @@ class ResponsesClient:
                 json.dump(
                     {
                         "status": status,
-                        "error": (error or "")[:2000],
+                        "error": scrub_api_keys(error or "")[:2000],
                         "model": model,
                         "request_id": request_id,
                         "at": _time.time(),
@@ -132,8 +183,13 @@ class ResponsesClient:
             attempt = 0
             while True:
                 try:
-                    async with httpx.AsyncClient(timeout=self.timeout) as client:
-                        resp = await client.post(self._url(), json=payload, headers=self.headers)
+                    client = await get_shared_client()
+                    resp = await client.post(
+                        self._url(),
+                        json=payload,
+                        headers=self.headers,
+                        timeout=self.timeout,
+                    )
                     if resp.status_code >= 400:
                         err_text = resp.text
                         self._dump_failure(
@@ -201,10 +257,11 @@ class ResponsesClient:
 
         Each yielded string has the form ``"event: <type>\\ndata: <json>"``.
 
-        The upstream POST + status check happen lazily on first iteration,
-        so callers serving an already-started HTTP stream should prime the
-        generator first (see :func:`prime_response_stream`) to surface
-        upstream rejections before response headers go out.
+        The upstream POST + status check happen lazily on first iteration.
+        Callers that need an upstream rejection *before* their own response
+        headers go out can prime via :func:`prime_response_stream`; the
+        /v1/messages path intentionally does not (Phase 2 optimistic start)
+        and maps post-header rejections to SSE ``error`` events instead.
         """
         if request_id:
             self.active_requests[request_id] = asyncio.Event()
@@ -218,10 +275,14 @@ class ResponsesClient:
             yielded_any = False
             while True:
                 try:
-                    async with httpx.AsyncClient(timeout=self.timeout) as client:
-                        async with client.stream(
-                            "POST", self._url(), json=body, headers=self.headers
-                        ) as resp:
+                    client = await get_shared_client()
+                    async with client.stream(
+                        "POST",
+                        self._url(),
+                        json=body,
+                        headers=self.headers,
+                        timeout=get_stream_timeout(),
+                    ) as resp:
                             if resp.status_code >= 400:
                                 err_body = await resp.aread()
                                 err_text = err_body.decode("utf-8", "replace")
@@ -235,31 +296,40 @@ class ResponsesClient:
                                     status_code=resp.status_code,
                                     detail=classify_responses_error(err_text),
                                 )
-                            event_type: Optional[str] = None
-                            data_lines: list = []
-                            async for line in resp.aiter_lines():
+                            # Phase 3: frame on raw bytes (aiter_bytes + blank-line
+                            # split) instead of aiter_lines: fewer per-line
+                            # Python ops and one decode per event. Cancellation
+                            # is checked per TCP chunk rather than per line.
+                            buf = bytearray()
+                            async for chunk in resp.aiter_bytes():
                                 if request_id and self.active_requests.get(request_id) is not None:
                                     if self.active_requests[request_id].is_set():
                                         raise HTTPException(
                                             status_code=499,
                                             detail="Request cancelled by client",
                                         )
-                                if not line.strip():
-                                    if event_type is not None or data_lines:
-                                        data = "\n".join(data_lines)
-                                        yielded_any = True
-                                        yield f"event: {event_type or 'message'}\ndata: {data}"
-                                    event_type, data_lines = None, []
+                                if not chunk:
                                     continue
-                                if line.startswith("event:"):
-                                    event_type = line[6:].strip()
-                                elif line.startswith("data:"):
-                                    data_lines.append(line[5:].strip())
-                                # ignore ":" comments and other fields
-                            if event_type is not None or data_lines:
-                                data = "\n".join(data_lines)
-                                yielded_any = True
-                                yield f"event: {event_type or 'message'}\ndata: {data}"
+                                buf += chunk
+                                if len(buf) > 1_000_000:
+                                    # A single SSE event without a blank-line
+                                    # boundary: pathological, don't OOM.
+                                    raise HTTPException(
+                                        status_code=500,
+                                        detail="Upstream SSE event exceeded 1MB",
+                                    )
+                                for text in _extract_sse_events(buf):
+                                    event_type, data = _parse_sse_event(text)
+                                    if data is None:
+                                        continue
+                                    yielded_any = True
+                                    yield f"event: {event_type}\ndata: {data}"
+                            tail = bytes(buf).decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
+                            if tail.strip():
+                                event_type, data = _parse_sse_event(tail)
+                                if data is not None:
+                                    yielded_any = True
+                                    yield f"event: {event_type}\ndata: {data}"
                     break
                 except HTTPException as e:
                     # Retryable only before any bytes were yielded (safe:

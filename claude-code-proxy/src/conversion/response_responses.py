@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import time
 import uuid
 from typing import Any, Dict, List
 
@@ -116,9 +117,22 @@ async def convert_responses_streaming_to_claude_with_cancellation(
     responses_client,
     request_id: str,
 ):
-    """Convert a Responses SSE stream to Claude SSE format with cancellation."""
+    """Convert a Responses SSE stream to Claude SSE format with cancellation.
+
+    Phase 2 optimistic start: the initial ``message_start`` /
+    ``content_block_start`` / ``ping`` burst is yielded before the upstream
+    POST completes, so response headers reach the client in milliseconds
+    regardless of upstream TTFT. The upstream generator is consumed lazily
+    inside the pump task; an upstream rejection after headers goes out is
+    therefore mapped to an SSE ``error`` event (the failure dump for
+    watch-429 has already been written by the client).
+    """
 
     message_id = f"msg_{uuid.uuid4().hex[:24]}"
+    _stream_t0 = time.monotonic()
+    _first_token_at: float | None = None
+    _prev_token_at: float | None = None
+    stats.record_stream()
 
     yield _sse(
         Constants.EVENT_MESSAGE_START,
@@ -145,11 +159,17 @@ async def convert_responses_streaming_to_claude_with_cancellation(
         },
     )
     yield _sse(Constants.EVENT_PING, {"type": Constants.EVENT_PING})
+    # SSE comment ping alongside the event ping: spec-ignored by clients,
+    # but edge proxies / LBs only reset idle timers on bytes.
+    yield ": ping\n\n"
 
     text_block_index = 0
     tool_block_counter = 0
-    # item_id -> {"claude_index", "id", "name", "args_buffer", "started", "done_sent"}
+    # item_id -> {"claude_index", "id", "name", "args_buffer", "sent_len", "started", "done_sent"}
     function_calls: Dict[str, Dict[str, Any]] = {}
+    # Arg fragments for ids not yet seen in output_item.added (out-of-order
+    # upstream); adopted when the added event arrives, dropped at the end.
+    pending_args: Dict[str, str] = {}
     has_function_call = False
     usage_data = {
         "input_tokens": 0,
@@ -164,8 +184,13 @@ async def convert_responses_streaming_to_claude_with_cancellation(
     # during long silent stretches (reasoning phases). Without bytes on the
     # wire, Claude Code shows "Waiting for API response" after ~20s and its
     # idle watchdogs eventually abort + retry the stream.
-    queue: "asyncio.Queue" = asyncio.Queue()
+    # Bounded queue applies backpressure: a fast upstream pauses instead of
+    # buffering unboundedly when the downstream client is slow.
+    queue: "asyncio.Queue" = asyncio.Queue(maxsize=100)
     upstream_done = asyncio.Event()
+    keepalive_interval = config.stream_keepalive_secs
+    # Disconnect polling stays finite even when ping emission is disabled.
+    _poll_interval = keepalive_interval if keepalive_interval > 0 else 15.0
 
     async def _pump():
         try:
@@ -178,12 +203,11 @@ async def convert_responses_streaming_to_claude_with_cancellation(
             await queue.put(("end", None))
 
     async def _keepalive():
-        interval = config.stream_keepalive_secs
-        if interval <= 0:
+        if keepalive_interval <= 0:
             return
         try:
             while not upstream_done.is_set():
-                await asyncio.sleep(interval)
+                await asyncio.sleep(keepalive_interval)
                 if not upstream_done.is_set():
                     await queue.put(("ping", None))
         except asyncio.CancelledError:
@@ -191,6 +215,7 @@ async def convert_responses_streaming_to_claude_with_cancellation(
 
     pump_task = asyncio.create_task(_pump())
     keepalive_task = asyncio.create_task(_keepalive())
+    _stream_failed = False
 
     try:
         while True:
@@ -199,11 +224,28 @@ async def convert_responses_streaming_to_claude_with_cancellation(
                 responses_client.cancel_request(request_id)
                 break
 
-            kind, item = await queue.get()
+            try:
+                # Silence itself triggers the wait so disconnects are
+                # detected even when neither upstream nor keepalive yields.
+                # (When keepalives are disabled the poll interval still
+                # applies so disconnects don't go unnoticed in silence.)
+                kind, item = await asyncio.wait_for(
+                    queue.get(), timeout=_poll_interval
+                )
+            except asyncio.TimeoutError:
+                if await http_request.is_disconnected():
+                    logger.info(
+                        f"Client disconnected during silence, cancelling {request_id}"
+                    )
+                    responses_client.cancel_request(request_id)
+                    break
+                continue
             if kind == "end":
                 break
             if kind == "ping":
+                stats.record_keepalive()
                 yield _sse(Constants.EVENT_PING, {"type": Constants.EVENT_PING})
+                yield ": ping\n\n"
                 continue
             if kind == "error":
                 raise item
@@ -215,6 +257,18 @@ async def convert_responses_streaming_to_claude_with_cancellation(
             if event_type == "response.output_text.delta":
                 delta = payload.get("delta")
                 if delta:
+                    _now = time.monotonic()
+                    if _first_token_at is None:
+                        _first_token_at = _now
+                        stats.record_ttft(_now - _stream_t0)
+                        logger.debug(
+                            "Stream %s TTFT client=%.1fms",
+                            request_id,
+                            (_now - _stream_t0) * 1000,
+                        )
+                    elif _prev_token_at is not None:
+                        stats.record_itl(_now - _prev_token_at)
+                    _prev_token_at = _now
                     yield _sse(
                         Constants.EVENT_CONTENT_BLOCK_DELTA,
                         {
@@ -237,11 +291,25 @@ async def convert_responses_streaming_to_claude_with_cancellation(
                         "claude_index": claude_index,
                         "id": item.get("call_id") or item.get("id") or item_id,
                         "name": item.get("name", ""),
-                        "args_buffer": item.get("arguments") or "",
+                        "args_buffer": "",
+                        "sent_len": 0,
                         "started": True,
                         "done_sent": False,
                     }
+                    # Seed with any delta fragments that arrived before the
+                    # added event (out-of-order upstream); they flush below.
+                    seed = pending_args.pop(item.get("id"), "") + pending_args.pop(
+                        item.get("call_id"), ""
+                    )
+                    if not item.get("arguments") and seed:
+                        function_calls[item_id]["args_buffer"] = seed
+                    elif item.get("arguments"):
+                        function_calls[item_id]["args_buffer"] = item.get("arguments")
                     has_function_call = True
+                    if _first_token_at is None:
+                        _first_token_at = time.monotonic()
+                        stats.record_ttft(_first_token_at - _stream_t0)
+                    _prev_token_at = time.monotonic()
                     yield _sse(
                         Constants.EVENT_CONTENT_BLOCK_START,
                         {
@@ -255,11 +323,49 @@ async def convert_responses_streaming_to_claude_with_cancellation(
                             },
                         },
                     )
+                    # Phase 3: forward any arguments snapshot incrementally
+                    # instead of waiting for the done event.
+                    initial_args = function_calls[item_id]["args_buffer"]
+                    if initial_args:
+                        yield _sse(
+                            Constants.EVENT_CONTENT_BLOCK_DELTA,
+                            {
+                                "type": Constants.EVENT_CONTENT_BLOCK_DELTA,
+                                "index": claude_index,
+                                "delta": {
+                                    "type": Constants.DELTA_INPUT_JSON,
+                                    "partial_json": initial_args,
+                                },
+                            },
+                        )
+                        function_calls[item_id]["sent_len"] = len(initial_args)
             elif event_type == "response.function_call_arguments.delta":
                 item_id = payload.get("item_id", "")
                 entry = function_calls.get(item_id)
-                if entry is not None and entry["started"]:
-                    entry["args_buffer"] += payload.get("delta", "")
+                fragment = payload.get("delta", "")
+                if not fragment:
+                    continue
+                if entry is None:
+                    # Added event hasn't arrived (or never will): buffer for
+                    # adoption at added-time instead of dropping the call.
+                    pending_args[item_id] = pending_args.get(item_id, "") + fragment
+                    continue
+                # Phase 3: stream each fragment as it arrives
+                # (Anthropic concatenates partial_json deltas).
+                entry["args_buffer"] += fragment
+                if entry["started"]:
+                    yield _sse(
+                        Constants.EVENT_CONTENT_BLOCK_DELTA,
+                        {
+                            "type": Constants.EVENT_CONTENT_BLOCK_DELTA,
+                            "index": entry["claude_index"],
+                            "delta": {
+                                "type": Constants.DELTA_INPUT_JSON,
+                                "partial_json": fragment,
+                            },
+                        },
+                    )
+                    entry["sent_len"] = len(entry["args_buffer"])
             elif event_type in (
                 "response.function_call_arguments.done",
                 "response.output_item.done",
@@ -272,7 +378,9 @@ async def convert_responses_streaming_to_claude_with_cancellation(
                     entry = function_calls.get(item_id)
                     if entry is None:
                         continue
-                    if item.get("arguments"):
+                    if item.get("arguments") and len(item["arguments"]) > len(
+                        entry["args_buffer"]
+                    ):
                         entry["args_buffer"] = item["arguments"]
                     if item.get("name"):
                         entry["name"] = item["name"]
@@ -281,20 +389,27 @@ async def convert_responses_streaming_to_claude_with_cancellation(
                     entry = function_calls.get(item_id)
                     if entry is None:
                         continue
-                    if payload.get("arguments"):
+                    if payload.get("arguments") and len(payload["arguments"]) > len(
+                        entry["args_buffer"]
+                    ):
                         entry["args_buffer"] = payload["arguments"]
                 if not entry["done_sent"]:
-                    yield _sse(
-                        Constants.EVENT_CONTENT_BLOCK_DELTA,
-                        {
-                            "type": Constants.EVENT_CONTENT_BLOCK_DELTA,
-                            "index": entry["claude_index"],
-                            "delta": {
-                                "type": Constants.DELTA_INPUT_JSON,
-                                "partial_json": entry["args_buffer"],
+                    # Phase 3 backstop: only the unsent tail (fragments
+                    # already streamed incrementally above).
+                    tail = entry["args_buffer"][entry.get("sent_len", 0):]
+                    if tail:
+                        yield _sse(
+                            Constants.EVENT_CONTENT_BLOCK_DELTA,
+                            {
+                                "type": Constants.EVENT_CONTENT_BLOCK_DELTA,
+                                "index": entry["claude_index"],
+                                "delta": {
+                                    "type": Constants.DELTA_INPUT_JSON,
+                                    "partial_json": tail,
+                                },
                             },
-                        },
-                    )
+                        )
+                        entry["sent_len"] = len(entry["args_buffer"])
                     entry["done_sent"] = True
             elif event_type == "response.completed":
                 response = payload.get("response", {}) or {}
@@ -329,13 +444,35 @@ async def convert_responses_streaming_to_claude_with_cancellation(
                     "error": {"type": "cancelled", "message": "Request was cancelled by client"},
                 },
             )
-            return
-        raise
+        else:
+            # Phase 2: headers already went out (optimistic start), so the
+            # status line is fixed at 200. Map the upstream rejection to an
+            # SSE error event with the same classified message the pre-header
+            # JSON path used. _dump_failure already recorded the failure for
+            # watch-429 before this exception was raised.
+            from src.core.responses_client import classify_responses_error
+
+            logger.error(
+                f"Stream {request_id} upstream {e.status_code} post-headers: {e.detail}"
+            )
+            stats.record_stream_error(e.status_code)
+            yield _sse(
+                "error",
+                {
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": classify_responses_error(e.detail),
+                    },
+                },
+            )
+        _stream_failed = True
     except Exception as e:
         logger.error(f"Streaming error: {e}")
         import traceback
 
         logger.error(traceback.format_exc())
+        stats.record_stream_error(500)
         yield _sse(
             "error",
             {
@@ -343,32 +480,47 @@ async def convert_responses_streaming_to_claude_with_cancellation(
                 "error": {"type": "api_error", "message": f"Streaming error: {str(e)}"},
             },
         )
-        return
+        _stream_failed = True
+    finally:
+        # Always stop background tasks: the old early returns skipped the
+        # cleanup below and leaked pump/keepalive (plus a queue.put blocked
+        # on a full queue with no consumer) forever.
+        upstream_done.set()
+        for task in (pump_task, keepalive_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(pump_task, keepalive_task, return_exceptions=True)
+        aclose = getattr(responses_stream, "aclose", None)
+        if aclose is not None:
+            try:
+                await aclose()
+            except Exception:
+                pass
 
-    # Stop background tasks before emitting the closing events.
-    upstream_done.set()
-    for task in (pump_task, keepalive_task):
-        if not task.done():
-            task.cancel()
+    if _stream_failed:
+        return
 
     # Streaming requests only count hits in endpoints.py — feed the final
     # usage (incl. cache hits) into stats here so tokens aren't invisible.
     stats.add_tokens(usage_data)
 
-    # Flush any function call that never got an explicit done event.
+    # Flush any function call that never got an explicit done event
+    # (only the unsent tail — fragments already streamed above).
     for entry in function_calls.values():
         if entry.get("started") and not entry.get("done_sent"):
-            yield _sse(
-                Constants.EVENT_CONTENT_BLOCK_DELTA,
-                {
-                    "type": Constants.EVENT_CONTENT_BLOCK_DELTA,
-                    "index": entry["claude_index"],
-                    "delta": {
-                        "type": Constants.DELTA_INPUT_JSON,
-                        "partial_json": entry.get("args_buffer", ""),
+            tail = entry.get("args_buffer", "")[entry.get("sent_len", 0):]
+            if tail:
+                yield _sse(
+                    Constants.EVENT_CONTENT_BLOCK_DELTA,
+                    {
+                        "type": Constants.EVENT_CONTENT_BLOCK_DELTA,
+                        "index": entry["claude_index"],
+                        "delta": {
+                            "type": Constants.DELTA_INPUT_JSON,
+                            "partial_json": tail,
+                        },
                     },
-                },
-            )
+                )
             entry["done_sent"] = True
 
     if has_function_call:

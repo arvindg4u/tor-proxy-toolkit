@@ -1,10 +1,23 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from src.api.endpoints import router as api_router
 import uvicorn
 import sys
 from src.core.config import config
+from src.core.http_client import aclose_shared_client, get_shared_client
 
-app = FastAPI(title="Claude-to-OpenAI API Proxy", version="1.0.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Init/close the shared upstream HTTP client (connection pooling)."""
+    await get_shared_client()
+    try:
+        yield
+    finally:
+        await aclose_shared_client()
+
+
+app = FastAPI(title="Claude-to-OpenAI API Proxy", version="1.0.0", lifespan=lifespan)
 
 app.include_router(api_router)
 
@@ -51,12 +64,31 @@ def main():
     print(f"   Max Tokens Limit: {config.max_tokens_limit}")
     print(f"   Request Timeout: {config.request_timeout}s")
     print(f"   Server: {config.host}:{config.port}")
+
+    # Phase 3: uvloop + httptools when installed. timeout-keep-alive is the
+    # *between-request* idle-socket timer (not an in-stream timer); 75s keeps
+    # slow SSE clients' keep-alive sockets warm. In-stream liveness comes
+    # from the SSE : ping heartbeats.
+    server_kwargs = {"timeout_keep_alive": 75}
+    try:
+        import uvloop  # noqa: F401
+
+        server_kwargs["loop"] = "uvloop"
+    except ImportError:
+        pass
+    try:
+        import httptools  # noqa: F401
+
+        server_kwargs["http"] = "httptools"
+    except ImportError:
+        pass
+    print(f"   Loop: {server_kwargs.get('loop', 'asyncio')} / HTTP: {server_kwargs.get('http', 'h11')}")
     print(f"   Client API Key Validation: {'Enabled' if config.anthropic_api_key else 'Disabled'}")
     print("")
 
     # Parse log level - extract just the first word to handle comments
     log_level = config.log_level.split()[0].lower()
-    
+
     # Validate and set default if invalid
     valid_levels = ['debug', 'info', 'warning', 'error', 'critical']
     if log_level not in valid_levels:
@@ -69,6 +101,7 @@ def main():
         port=config.port,
         log_level=log_level,
         reload=False,
+        **server_kwargs,
     )
 
 

@@ -1,16 +1,18 @@
 from fastapi import APIRouter, HTTPException, Request, Header, Depends
 from fastapi.responses import JSONResponse, StreamingResponse
 from datetime import datetime
+import asyncio
 import os
 import time
 import uuid
-import httpx
 from typing import Optional
 
 from src.core.config import config
+from src.core.guards import body_too_large, sanitize_passthrough_path, scrub_api_keys
+from src.core.http_client import get_shared_client, get_stream_timeout
 from src.core.logging import logger
 from src.core.client import OpenAIClient
-from src.core.responses_client import ResponsesClient, prime_response_stream
+from src.core.responses_client import ResponsesClient
 from src.core.stats import stats
 from src.api.dashboard import dashboard_response
 from src.models.claude import ClaudeMessagesRequest, ClaudeTokenCountRequest
@@ -27,6 +29,12 @@ from src.conversion.response_responses import (
 from src.core.model_manager import model_manager
 
 router = APIRouter()
+
+# Max request bodies (Content-Length guard; chunked bodies bypass the check
+# but this is a localhost proxy — the guard stops trivial OOMs).
+MAX_MESSAGES_BODY_BYTES = 20_000_000
+MAX_PASSTHROUGH_BODY_BYTES = 20_000_000
+MAX_COUNT_TOKENS_BODY_BYTES = 1_000_000
 
 # Get custom headers from config, layered over the OpenCode identity
 # headers (session/UA) that ZEN's free tier requires.
@@ -57,7 +65,7 @@ async def validate_api_key(x_api_key: Optional[str] = Header(None), authorizatio
     if x_api_key:
         client_api_key = x_api_key
     elif authorization and authorization.startswith("Bearer "):
-        client_api_key = authorization.replace("Bearer ", "")
+        client_api_key = authorization[len("Bearer "):]
     
     # Skip validation if ANTHROPIC_API_KEY is not set in the environment
     if not config.anthropic_api_key:
@@ -74,7 +82,8 @@ async def validate_api_key(x_api_key: Optional[str] = Header(None), authorizatio
 @router.post("/v1/messages")
 async def create_message(request: ClaudeMessagesRequest, http_request: Request, _: None = Depends(validate_api_key)):
     t0 = time.monotonic()
-    status = 200
+    if body_too_large(http_request.headers, MAX_MESSAGES_BODY_BYTES):
+        raise HTTPException(status_code=413, detail="Request body too large")
     try:
         logger.debug(
             f"Processing Claude request: model={request.model}, stream={request.stream}"
@@ -99,46 +108,34 @@ async def create_message(request: ClaudeMessagesRequest, http_request: Request, 
             raise HTTPException(status_code=499, detail="Client disconnected")
 
         if request.stream:
-            # Streaming response - wrap in error handling
-            try:
-                openai_stream = openai_client.create_chat_completion_stream(
-                    openai_request, request_id
-                )
-                stats.record(
-                    "/v1/messages",
-                    status=200,
-                    latency=time.monotonic() - t0,  # accepted; tokens not counted for streams
-                )
-                return StreamingResponse(
-                    convert_openai_streaming_to_claude_with_cancellation(
-                        openai_stream,
-                        request,
-                        logger,
-                        http_request,
-                        openai_client,
-                        request_id,
-                    ),
-                    media_type="text/event-stream",
-                    headers={
-                        "Cache-Control": "no-cache",
-                        "Connection": "keep-alive",
-                        "Access-Control-Allow-Origin": "*",
-                        "Access-Control-Allow-Headers": "*",
-                    },
-                )
-            except HTTPException as e:
-                # Convert to proper error response for streaming
-                logger.error(f"Streaming error: {e.detail}")
-                import traceback
-
-                logger.error(traceback.format_exc())
-                status = e.status_code
-                error_message = openai_client.classify_openai_error(e.detail)
-                error_response = {
-                    "type": "error",
-                    "error": {"type": "api_error", "message": error_message},
-                }
-                return JSONResponse(status_code=e.status_code, content=error_response)
+            # Optimistic start (mirrors the responses path): headers go out
+            # immediately; upstream errors surface as SSE error events in the
+            # converter. (create_chat_completion_stream is a lazy async
+            # generator, so there is nothing to prime here.)
+            openai_stream = openai_client.create_chat_completion_stream(
+                openai_request, request_id
+            )
+            stats.record(
+                "/v1/messages",
+                status=200,
+                latency=time.monotonic() - t0,  # accepted; tokens not counted for streams
+            )
+            return StreamingResponse(
+                convert_openai_streaming_to_claude_with_cancellation(
+                    openai_stream,
+                    request,
+                    logger,
+                    http_request,
+                    openai_client,
+                    request_id,
+                ),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
         else:
             # Non-streaming response
             openai_response = await openai_client.create_chat_completion(
@@ -170,7 +167,6 @@ async def create_message(request: ClaudeMessagesRequest, http_request: Request, 
 
 async def _handle_responses_message(request: ClaudeMessagesRequest, http_request: Request, request_id: str, t0: float):
     """Serve /v1/messages via the Responses API upstream."""
-    from src.core.responses_client import classify_responses_error
 
     # Convert Claude request to Responses format
     responses_request = convert_claude_to_responses(request, model_manager)
@@ -181,44 +177,32 @@ async def _handle_responses_message(request: ClaudeMessagesRequest, http_request
         raise HTTPException(status_code=499, detail="Client disconnected")
 
     if request.stream:
-        try:
-            responses_stream = responses_client.create_response_stream(
-                responses_request, request_id
-            )
-            # Prime before headers go out: forces the upstream POST + status
-            # check now, so an upstream rejection becomes a JSON error
-            # instead of a killed stream mid-response.
-            responses_stream = await prime_response_stream(responses_stream)
-            stats.record("/v1/messages", status=200, latency=time.monotonic() - t0)
-            return StreamingResponse(
-                convert_responses_streaming_to_claude_with_cancellation(
-                    responses_stream,
-                    request,
-                    logger,
-                    http_request,
-                    responses_client,
-                    request_id,
-                ),
+        # Phase 2 optimistic start: return StreamingResponse immediately so
+        # headers reach the client in milliseconds. The upstream POST runs
+        # lazily inside the converter's pump task; an upstream rejection
+        # after headers maps to an SSE error event there (same classified
+        # message the pre-header JSON path used to return).
+        responses_stream = responses_client.create_response_stream(
+            responses_request, request_id
+        )
+        logger.debug("Stream %s headers out, upstream priming concurrently", request_id)
+        stats.record("/v1/messages", status=200, latency=time.monotonic() - t0)
+        return StreamingResponse(
+            convert_responses_streaming_to_claude_with_cancellation(
+                responses_stream,
+                request,
+                logger,
+                http_request,
+                responses_client,
+                request_id,
+            ),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
                     "Connection": "keep-alive",
-                    "Access-Control-Allow-Origin": "*",
-                    "Access-Control-Allow-Headers": "*",
+                    "X-Accel-Buffering": "no",
                 },
             )
-        except HTTPException as e:
-            logger.error(f"Responses streaming error: {e.detail}")
-            import traceback
-
-            logger.error(traceback.format_exc())
-            stats.record("/v1/messages", status=e.status_code, latency=time.monotonic() - t0)
-            error_message = classify_responses_error(e.detail)
-            error_response = {
-                "type": "error",
-                "error": {"type": "api_error", "message": error_message},
-            }
-            return JSONResponse(status_code=e.status_code, content=error_response)
     else:
         responses_object = await responses_client.create_response(
             responses_request, request_id
@@ -229,7 +213,9 @@ async def _handle_responses_message(request: ClaudeMessagesRequest, http_request
 
 
 @router.post("/v1/messages/count_tokens")
-async def count_tokens(request: ClaudeTokenCountRequest, _: None = Depends(validate_api_key)):
+async def count_tokens(request: ClaudeTokenCountRequest, http_request: Request, _: None = Depends(validate_api_key)):
+    if body_too_large(http_request.headers, MAX_COUNT_TOKENS_BODY_BYTES):
+        raise HTTPException(status_code=413, detail="Request body too large")
     try:
         # For token counting, we'll use a simple estimation
         # In a real implementation, you might want to use tiktoken or similar
@@ -263,7 +249,7 @@ async def count_tokens(request: ClaudeTokenCountRequest, _: None = Depends(valid
 
     except Exception as e:
         logger.error(f"Error counting tokens: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal error")
 
 
 @router.get("/health")
@@ -279,7 +265,7 @@ async def health_check():
 
 
 @router.get("/test-connection")
-async def test_connection():
+async def test_connection(_: None = Depends(validate_api_key)):
     """Test API connectivity to OpenAI"""
     try:
         # Simple test request to verify API connectivity
@@ -319,13 +305,21 @@ async def test_connection():
 
 @router.post("/v1/responses")
 @router.post("/v1/responses/{path:path}")
-async def passthrough_responses(request: Request, path: str = ""):
+async def passthrough_responses(
+    request: Request, path: str = "", _: None = Depends(validate_api_key)
+):
     """Passthrough for OpenAI Responses API (/v1/responses/*)"""
+    if body_too_large(request.headers, MAX_PASSTHROUGH_BODY_BYTES):
+        raise HTTPException(status_code=413, detail="Request body too large")
+    try:
+        safe_path = sanitize_passthrough_path(path)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid path")
     body = await request.body()
     url = f"{config.openai_base_url}/responses"
-    if path:
-        url += f"/{path}"
-    
+    if safe_path:
+        url += f"/{safe_path}"
+
     headers = {
         "Authorization": f"Bearer {config.openai_api_key}",
         "Content-Type": "application/json",
@@ -333,7 +327,7 @@ async def passthrough_responses(request: Request, path: str = ""):
     }
     # Forward query params
     params = dict(request.query_params)
-    
+
     is_stream = False
     try:
         import json
@@ -341,43 +335,130 @@ async def passthrough_responses(request: Request, path: str = ""):
         is_stream = payload.get("stream", False)
     except Exception:
         pass
-    
+
     if is_stream:
-        async def stream_gen():
-            async with httpx.AsyncClient(timeout=config.request_timeout) as client:
-                async with client.stream(
-                    "POST", url, content=body, headers=headers, params=params
-                ) as resp:
-                    if resp.status_code >= 400:
-                        err_body = await resp.aread()
-                        yield err_body
-                        return
-                    async for chunk in resp.aiter_bytes():
-                        yield chunk
-        return StreamingResponse(stream_gen(), media_type="text/event-stream", headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "Access-Control-Allow-Origin": "*",
-        })
+        stats.record("/v1/responses", status=200)
+        return StreamingResponse(
+            _passthrough_stream_gen(request, url, body, headers, params),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
     else:
-        async with httpx.AsyncClient(timeout=config.request_timeout) as client:
-            resp = await client.post(url, content=body, headers=headers, params=params)
-            return JSONResponse(status_code=resp.status_code, content=resp.json())
+        try:
+            client = await get_shared_client()
+            resp = await client.post(
+                url, content=body, headers=headers, params=params,
+                timeout=config.request_timeout,
+            )
+            stats.record("/v1/responses", status=resp.status_code)
+            try:
+                data = resp.json()
+            except Exception:
+                data = {
+                    "error": {
+                        "type": "api_error",
+                        "message": scrub_api_keys(resp.text[:2000]),
+                    }
+                }
+            return JSONResponse(status_code=resp.status_code, content=data)
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Passthrough /v1/responses failed: {e}")
+            stats.record("/v1/responses", status=502)
+            return JSONResponse(
+                status_code=502,
+                content={"error": {"type": "api_error", "message": "Upstream unavailable, retry"}},
+            )
+
+
+async def _passthrough_stream_gen(request, url, body, headers, params):
+    """Forward an upstream SSE stream with keepalive + disconnect hygiene.
+
+    Errors (including upstream rejections) become a best-effort
+    ``data: {"error": ...}`` frame — headers are already committed — plus
+    stats; raw upstream bodies are never forwarded verbatim.
+    """
+    import json as _json
+
+    keepalive = config.stream_keepalive_secs if config.stream_keepalive_secs > 0 else 15.0
+    pending = None
+    try:
+        client = await get_shared_client()
+        async with client.stream(
+            "POST", url, content=body, headers=headers, params=params,
+            timeout=get_stream_timeout(),
+        ) as resp:
+            if resp.status_code >= 400:
+                err_body = await resp.aread()
+                stats.record_stream_error(resp.status_code)
+                yield _passthrough_error_frame(err_body.decode("utf-8", "replace"))
+                return
+            it = resp.aiter_bytes()
+            while True:
+                if pending is None:
+                    pending = asyncio.create_task(it.__anext__())
+                try:
+                    # Shield the read: a keepalive timeout must not cancel
+                    # the in-flight chunk (the same task is re-awaited).
+                    chunk = await asyncio.wait_for(asyncio.shield(pending), timeout=keepalive)
+                except StopAsyncIteration:
+                    pending = None
+                    break
+                except asyncio.TimeoutError:
+                    if await request.is_disconnected():
+                        break
+                    stats.record_keepalive()
+                    yield b": ping\n\n"
+                    continue
+                pending = None
+                if chunk:
+                    yield chunk
+                if await request.is_disconnected():
+                    break
+    except HTTPException as e:
+        stats.record_stream_error(e.status_code or 500)
+        yield _passthrough_error_frame(str(e.detail))
+    except Exception as e:
+        logger.error(f"Passthrough stream failed: {e}")
+        stats.record_stream_error(502)
+        yield _passthrough_error_frame("Upstream unavailable, retry")
+    finally:
+        if pending is not None and not pending.done():
+            pending.cancel()
+
+
+def _passthrough_error_frame(detail: str) -> bytes:
+    """Best-effort OpenAI-protocol error frame (classified, scrubbed)."""
+    import json as _json
+
+    from src.core.responses_client import classify_responses_error
+
+    message = scrub_api_keys(classify_responses_error(detail)[-2000:])
+    return ("data: " + _json.dumps({"error": {"message": message}}) + "\n\n").encode()
 
 
 @router.post("/v1/chat/completions")
-async def passthrough_chat_completions(request: Request):
+async def passthrough_chat_completions(
+    request: Request, _: None = Depends(validate_api_key)
+):
     """Passthrough for OpenAI Chat Completions API (/v1/chat/completions)"""
+    if body_too_large(request.headers, MAX_PASSTHROUGH_BODY_BYTES):
+        raise HTTPException(status_code=413, detail="Request body too large")
     body = await request.body()
     url = f"{config.openai_base_url}/chat/completions"
-    
+
     headers = {
         "Authorization": f"Bearer {config.openai_api_key}",
         "Content-Type": "application/json",
         **config.get_upstream_headers(),
     }
     params = dict(request.query_params)
-    
+
     is_stream = False
     try:
         import json
@@ -385,28 +466,45 @@ async def passthrough_chat_completions(request: Request):
         is_stream = payload.get("stream", False)
     except Exception:
         pass
-    
+
     if is_stream:
-        async def stream_gen():
-            async with httpx.AsyncClient(timeout=config.request_timeout) as client:
-                async with client.stream(
-                    "POST", url, content=body, headers=headers, params=params
-                ) as resp:
-                    if resp.status_code >= 400:
-                        err_body = await resp.aread()
-                        yield err_body
-                        return
-                    async for chunk in resp.aiter_bytes():
-                        yield chunk
-        return StreamingResponse(stream_gen(), media_type="text/event-stream", headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "Access-Control-Allow-Origin": "*",
-        })
+        stats.record("/v1/chat/completions", status=200)
+        return StreamingResponse(
+            _passthrough_stream_gen(request, url, body, headers, params),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
     else:
-        async with httpx.AsyncClient(timeout=config.request_timeout) as client:
-            resp = await client.post(url, content=body, headers=headers, params=params)
-            return JSONResponse(status_code=resp.status_code, content=resp.json())
+        try:
+            client = await get_shared_client()
+            resp = await client.post(
+                url, content=body, headers=headers, params=params,
+                timeout=config.request_timeout,
+            )
+            stats.record("/v1/chat/completions", status=resp.status_code)
+            try:
+                data = resp.json()
+            except Exception:
+                data = {
+                    "error": {
+                        "type": "api_error",
+                        "message": scrub_api_keys(resp.text[:2000]),
+                    }
+                }
+            return JSONResponse(status_code=resp.status_code, content=data)
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Passthrough /v1/chat/completions failed: {e}")
+            stats.record("/v1/chat/completions", status=502)
+            return JSONResponse(
+                status_code=502,
+                content={"error": {"type": "api_error", "message": "Upstream unavailable, retry"}},
+            )
 
 
 @router.get("/api/status")
@@ -428,6 +526,10 @@ async def api_status():
         if os.path.exists(path):
             with open(path) as f:
                 last_failure = _json.load(f)
+            if isinstance(last_failure, dict):
+                # Scrub key-like fragments upstream echoes in errors.
+                if last_failure.get("error"):
+                    last_failure["error"] = scrub_api_keys(last_failure["error"])
             if isinstance(last_failure, dict) and "at" not in last_failure:
                 # Legacy dump: no timestamp, no error text. Treat as stale
                 # but keep the status so old watchers still see a 429.
@@ -453,7 +555,7 @@ async def api_status():
                     failure_history.append(
                         {
                             "status": d.get("status"),
-                            "error": str(d.get("error", ""))[:300],
+                            "error": scrub_api_keys(str(d.get("error", ""))[:300]),
                             "model": d.get("model"),
                             "at": d.get("at", 0),
                         }

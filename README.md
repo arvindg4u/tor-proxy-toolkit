@@ -47,6 +47,9 @@ cd tor-proxy-toolkit
 cp .env.example .env
 nano .env  # Add your API keys
 
+# 2b. Python deps for the Claude proxy (start.sh also auto-installs these)
+pip install -r claude-code-proxy/requirements.txt
+
 # 3. Start everything
 bash start.sh
 
