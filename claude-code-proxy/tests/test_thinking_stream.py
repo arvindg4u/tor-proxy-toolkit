@@ -20,6 +20,7 @@ os.environ.setdefault("OPENAI_API_KEY", "sk-test-dummy")
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from src.conversion.request_converter import convert_claude_to_openai  # noqa: E402
 from src.conversion.request_responses import convert_claude_to_responses  # noqa: E402
 from src.conversion.response_responses import (  # noqa: E402
     convert_responses_streaming_to_claude_with_cancellation,
@@ -217,9 +218,58 @@ def test_non_streaming_thinking_parity():
     assert out["content"][1] == {"type": "text", "text": "Done."}
 
 
+def test_history_with_thinking_blocks_parses_and_converts():
+    """Regression: 422 on history echoing proxy-emitted thinking blocks.
+
+    Claude Code passes thinking blocks back in the next turn's history.
+    The request models must accept them (converters drop them upstream).
+    """
+    raw = {
+        "model": "claude-opus-4-8",
+        "max_tokens": 100,
+        "messages": [
+            {"role": "user", "content": "do it"},
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": "Verifying conventions",
+                        "signature": "",
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "call_1",
+                        "name": "Bash",
+                        "input": {"command": "ls"},
+                    },
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "call_1",
+                        "content": "ok",
+                    }
+                ],
+            },
+        ],
+    }
+    req = ClaudeMessagesRequest.model_validate(raw)  # must not raise (was 422)
+    out = convert_claude_to_responses(req, StubModelManager())
+    calls = [i for i in out["input"] if i.get("type") == "function_call"]
+    assert len(calls) == 1 and calls[0]["name"] == "Bash", out["input"]
+    chat = convert_claude_to_openai(req, StubModelManager())
+    tool_calls = chat["messages"][1].get("tool_calls", [])
+    assert len(tool_calls) == 1, chat["messages"]
+
+
 if __name__ == "__main__":
     test_summary_requested_only_when_thinking_enabled()
     test_reasoning_streams_as_thinking_block()
     test_no_thinking_when_disabled()
     test_non_streaming_thinking_parity()
-    print("test_thinking_stream: all 4 tests passed")
+    test_history_with_thinking_blocks_parses_and_converts()
+    print("test_thinking_stream: all 5 tests passed")
