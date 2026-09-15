@@ -12,6 +12,73 @@ from collections import deque
 from typing import Any, Dict, List, Optional
 
 
+# Max conversations tracked for the message_start usage base. Bounds memory
+# when many sessions share one proxy process; the oldest conversation's
+# base is evicted first (its next turn simply starts from zero again).
+_MAX_USAGE_KEYS = 16
+
+
+def _block_text(block: Any, limit: int = 500) -> str:
+    """Best-effort text of one content block (pydantic or plain dict)."""
+    if isinstance(block, str):
+        return block[:limit]
+    if hasattr(block, "type"):
+        if getattr(block, "type") != "text":
+            return ""
+        return str(getattr(block, "text", "") or "")[:limit]
+    if isinstance(block, dict):
+        if block.get("type") != "text":
+            return ""
+        return str(block.get("text", "") or "")[:limit]
+    return ""
+
+
+def _message_text(msg: Any, limit: int = 500) -> str:
+    content = getattr(msg, "content", None)
+    if content is None and isinstance(msg, dict):
+        content = msg.get("content")
+    if isinstance(content, str):
+        return content[:limit]
+    if isinstance(content, list):
+        return "".join(_block_text(b) for b in content)[:limit]
+    return ""
+
+
+def request_usage_key(request: Any) -> str:
+    """Fingerprint one conversation for the message_start usage base.
+
+    The Messages API is stateless — no session id travels on the wire — so
+    concurrent CLI sessions are told apart by (model, system prompt head,
+    first-turn text). Only the conversation *prefix* is used because turns
+    only append messages: anything that changes turn to turn (turn count,
+    latest text) would make each turn look like a new conversation and the
+    base would never carry forward. Two sessions opened with byte-identical
+    first prompts share a key (rare; message_delta corrects any remainder
+    at turn end regardless).
+    """
+    import hashlib
+
+    model = str(getattr(request, "model", "") or "")
+    system = getattr(request, "system", None)
+    if isinstance(system, str):
+        system_text = system
+    elif isinstance(system, list):
+        system_text = "".join(_block_text(b, limit=2000) for b in system)
+    elif isinstance(system, dict):
+        system_text = str(system.get("text", ""))
+    else:
+        system_text = ""
+    messages = getattr(request, "messages", None) or []
+    if isinstance(messages, dict):
+        messages = messages.get("messages", []) or []
+    first = _message_text(messages[0]) if isinstance(messages, list) and messages else ""
+    h = hashlib.sha1()
+    for part in (model, system_text[:2000], first):
+        h.update(part.encode("utf-8", "replace"))
+        h.update(b"\0")
+    return h.hexdigest()[:16]
+
+
 def _percentile(sorted_vals: List[float], q: float) -> float:
     """Nearest-rank percentile of a pre-sorted list (q in 0..1)."""
     if not sorted_vals:
@@ -67,6 +134,11 @@ class ProxyStats:
         self.tokens_in = 0
         self.tokens_out = 0
         self.tokens_cached = 0
+        # Last completed response's usage per conversation key (Claude-shape
+        # keys); reported in the next message_start so the live counter
+        # stays continuous. LRU-capped: concurrent sessions each keep
+        # their own base instead of borrowing each other's.
+        self._last_usage: Dict[str, Dict[str, int]] = {}
         self.latency_sum = 0.0
         self.latency_count = 0
         self.last_error_at: Optional[float] = None
@@ -180,8 +252,71 @@ class ProxyStats:
         with self._lock:
             self.keepalive_sent += count
 
-    def add_tokens(self, usage: Optional[Dict[str, Any]]):
+    def note_response_usage(
+        self, usage: Optional[Dict[str, Any]], key: str = "default"
+    ) -> None:
+        """Remember a completed response's usage for message_start.
+
+        The Claude client builds its live context counter from the usage in
+        ``message_start`` and only corrects it at ``message_delta``. Real
+        Anthropic sends the true (cumulative) input counts there; sending
+        zeros makes the displayed counter collapse at every turn start and
+        jump back at turn end. The upstream only reports usage at the end
+        of a response, so the previous turn's totals are the best base for
+        the next turn's live display.
+
+        ``key`` scopes the snapshot per conversation (see
+        :func:`request_usage_key`) so concurrent sessions never borrow
+        each other's base. Entries are LRU-capped; a full cache evicts the
+        oldest conversation first.
+        """
+        if not usage:
+            return
+        with self._lock:
+            if key in self._last_usage:
+                del self._last_usage[key]
+            elif len(self._last_usage) >= _MAX_USAGE_KEYS:
+                oldest = next(iter(self._last_usage))
+                del self._last_usage[oldest]
+            self._last_usage[key] = {
+                "input_tokens": int(
+                    usage.get("prompt_tokens") or usage.get("input_tokens") or 0
+                ),
+                "output_tokens": 0,  # nothing generated yet this turn
+                "cache_read_input_tokens": int(
+                    usage.get("cache_read_input_tokens", 0)
+                    or (usage.get("prompt_tokens_details") or {}).get(
+                        "cached_tokens", 0
+                    )
+                    or (usage.get("input_tokens_details") or {}).get(
+                        "cached_tokens", 0
+                    )
+                ),
+                "cache_creation_input_tokens": int(
+                    usage.get("cache_creation_input_tokens", 0)
+                ),
+            }
+
+    def last_response_usage(self, key: str = "default") -> Dict[str, int]:
+        """Usage base for the next message_start (zeros before first use)."""
+        with self._lock:
+            return dict(
+                self._last_usage.get(
+                    key,
+                    {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "cache_read_input_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                    },
+                )
+            )
+
+    def add_tokens(
+        self, usage: Optional[Dict[str, Any]], key: str = "default"
+    ):
         """Add token usage without counting a new request."""
+        self.note_response_usage(usage, key=key)
         if not usage:
             return
         with self._lock:

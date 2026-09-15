@@ -4,7 +4,7 @@ import uuid
 from fastapi import HTTPException, Request
 from src.core.constants import Constants
 from src.conversion.tool_names import from_upstream_name
-from src.core.stats import stats
+from src.core.stats import request_usage_key, stats
 from src.models.claude import ClaudeMessagesRequest
 
 
@@ -110,6 +110,13 @@ def convert_openai_to_claude_response(
         },
     }
 
+    # Snapshot for the next turn's message_start base (non-streaming turns
+    # count here too, so a non-streamed turn doesn't leave a stale base).
+    stats.note_response_usage(
+        claude_response["usage"],
+        key=request_usage_key(original_request),
+    )
+
     return claude_response
 
 
@@ -119,9 +126,11 @@ async def convert_openai_streaming_to_claude(
     """Convert OpenAI streaming response to Claude streaming format."""
 
     message_id = f"msg_{uuid.uuid4().hex[:24]}"
+    # Per-conversation usage base: concurrent sessions each keep their own.
+    usage_key = request_usage_key(original_request)
 
     # Send initial SSE events
-    yield f"event: {Constants.EVENT_MESSAGE_START}\ndata: {json.dumps({'type': Constants.EVENT_MESSAGE_START, 'message': {'id': message_id, 'type': 'message', 'role': Constants.ROLE_ASSISTANT, 'model': original_request.model, 'content': [], 'stop_reason': None, 'stop_sequence': None, 'usage': {'input_tokens': 0, 'output_tokens': 0}}}, ensure_ascii=False)}\n\n"
+    yield f"event: {Constants.EVENT_MESSAGE_START}\ndata: {json.dumps({'type': Constants.EVENT_MESSAGE_START, 'message': {'id': message_id, 'type': 'message', 'role': Constants.ROLE_ASSISTANT, 'model': original_request.model, 'content': [], 'stop_reason': None, 'stop_sequence': None, 'usage': stats.last_response_usage(usage_key)}}, ensure_ascii=False)}\n\n"
 
     yield f"event: {Constants.EVENT_CONTENT_BLOCK_START}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_START, 'index': 0, 'content_block': {'type': Constants.CONTENT_TEXT, 'text': ''}}, ensure_ascii=False)}\n\n"
 
@@ -231,7 +240,7 @@ async def convert_openai_streaming_to_claude(
         return
 
     # Send final SSE events
-    stats.add_tokens(usage_data)
+    stats.add_tokens(usage_data, key=usage_key)
     # Backstop: flush any tool-args tail that arrived before its block
     # started (or after the last incremental forward).
     for tool_data in current_tool_calls.values():
@@ -266,9 +275,11 @@ async def convert_openai_streaming_to_claude_with_cancellation(
     _first_token_at = None
     _prev_token_at = None
     stats.record_stream()
+    # Per-conversation usage base: concurrent sessions each keep their own.
+    usage_key = request_usage_key(original_request)
 
     # Send initial SSE events
-    yield f"event: {Constants.EVENT_MESSAGE_START}\ndata: {json.dumps({'type': Constants.EVENT_MESSAGE_START, 'message': {'id': message_id, 'type': 'message', 'role': Constants.ROLE_ASSISTANT, 'model': original_request.model, 'content': [], 'stop_reason': None, 'stop_sequence': None, 'usage': {'input_tokens': 0, 'output_tokens': 0}}}, ensure_ascii=False)}\n\n"
+    yield f"event: {Constants.EVENT_MESSAGE_START}\ndata: {json.dumps({'type': Constants.EVENT_MESSAGE_START, 'message': {'id': message_id, 'type': 'message', 'role': Constants.ROLE_ASSISTANT, 'model': original_request.model, 'content': [], 'stop_reason': None, 'stop_sequence': None, 'usage': stats.last_response_usage(usage_key)}}, ensure_ascii=False)}\n\n"
 
     yield f"event: {Constants.EVENT_CONTENT_BLOCK_START}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_START, 'index': 0, 'content_block': {'type': Constants.CONTENT_TEXT, 'text': ''}}, ensure_ascii=False)}\n\n"
 

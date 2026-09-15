@@ -11,7 +11,7 @@ from fastapi import HTTPException, Request
 from src.core.config import config
 from src.core.constants import Constants
 from src.conversion.tool_names import from_upstream_name
-from src.core.stats import stats
+from src.core.stats import request_usage_key, stats
 from src.models.claude import ClaudeMessagesRequest
 
 
@@ -86,6 +86,19 @@ def convert_responses_to_claude_response(
     stop_reason = _map_status_to_stop_reason(responses_response, has_function_call)
 
     usage = responses_response.get("usage", {}) or {}
+    # Snapshot for the next turn's message_start base (non-streaming turns
+    # count here too, so a non-streamed turn doesn't leave a stale base).
+    stats.note_response_usage(
+        {
+            "input_tokens": usage.get("input_tokens", 0),
+            "output_tokens": usage.get("output_tokens", 0),
+            "cache_read_input_tokens": (
+                usage.get("input_tokens_details") or {}
+            ).get("cached_tokens", 0),
+            "cache_creation_input_tokens": 0,
+        },
+        key=request_usage_key(original_request),
+    )
     claude_response = {
         "id": responses_response.get("id", f"msg_{uuid.uuid4().hex[:24]}"),
         "type": "message",
@@ -159,6 +172,8 @@ async def convert_responses_streaming_to_claude_with_cancellation(
     _first_token_at: float | None = None
     _prev_token_at: float | None = None
     stats.record_stream()
+    # Per-conversation usage base: concurrent sessions each keep their own.
+    usage_key = request_usage_key(original_request)
 
     yield _sse(
         Constants.EVENT_MESSAGE_START,
@@ -172,7 +187,9 @@ async def convert_responses_streaming_to_claude_with_cancellation(
                 "content": [],
                 "stop_reason": None,
                 "stop_sequence": None,
-                "usage": {"input_tokens": 0, "output_tokens": 0},
+                # Last turn's totals: keeps the live context counter
+                # continuous instead of collapsing to zero each turn.
+                "usage": stats.last_response_usage(usage_key),
             },
         },
     )
@@ -608,7 +625,8 @@ async def convert_responses_streaming_to_claude_with_cancellation(
 
     # Streaming requests only count hits in endpoints.py — feed the final
     # usage (incl. cache hits) into stats here so tokens aren't invisible.
-    stats.add_tokens(usage_data)
+    # Also snapshots it as the next turn's message_start base.
+    stats.add_tokens(usage_data, key=usage_key)
 
     # Flush any function call that never got an explicit done event
     # (only the unsent tail — fragments already streamed above).
