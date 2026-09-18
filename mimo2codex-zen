@@ -1,0 +1,98 @@
+#!/bin/bash
+# Single mimo2codex instance on :8788 (Codex CLI -> Kilo gateway).
+# ALL upstream traffic (api.kilo.ai:443) goes via the WG tunnel
+# (stable 127.0.0.1:18104), scoped to this process only — nothing global,
+# no system exports.
+# Fail-closed: refuses to start when the tunnel is down, so traffic can never
+# silently leak direct.
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+STUDIO="$(cd "$SCRIPT_DIR/.." && pwd)"
+PID_DIR="/tmp/tor-toolkit-pids"
+LOG_DIR="${HOME}/.claude/zen-logs"
+PIDFILE="$PID_DIR/mimo2codex.pid"
+LOGFILE="$LOG_DIR/mimo2codex-8788.log"
+
+# Portable binary lookup: repo-local install first, then PATH.
+find_bin() {
+    for c in "$STUDIO/tools/node_modules/.bin/mimo2codex" \
+             "$HOME/tools/node_modules/.bin/mimo2codex"; do
+        [ -x "$c" ] && { echo "$c"; return 0; }
+    done
+    command -v mimo2codex 2>/dev/null
+}
+
+do_start() {
+    BIN="$(find_bin)"
+    [ -n "$BIN" ] || { echo "[✗] mimo2codex binary not found (expected $STUDIO/tools/node_modules/.bin/mimo2codex)"; return 1; }
+    # Tunnel upstream (process-scoped). NO_PROXY covers only localhost, so
+    # local :8788 stays direct while api.kilo.ai goes via the tunnel.
+    _wg_state="$STUDIO/wgtunnel/wireproxy"
+    _wg_port="$(cat "$_wg_state/stable.port" 2>/dev/null || echo 18104)"
+    if [ ! -f "$_wg_state/active.pid" ] \
+       || ! kill -0 "$(cat "$_wg_state/active.pid")" 2>/dev/null; then
+        echo "[✗] Tunnel is DOWN — start it first: ./wgtunnel/wireproxy/manage.sh start <peer>"
+        echo "    (fail-closed: refusing direct upstream so nothing leaks)"
+        return 1
+    fi
+    export HTTP_PROXY="http://127.0.0.1:$_wg_port" HTTPS_PROXY="http://127.0.0.1:$_wg_port"
+    export http_proxy="$HTTP_PROXY" https_proxy="$HTTPS_PROXY"
+    export NO_PROXY="127.0.0.1,localhost" no_proxy="127.0.0.1,localhost"
+    mkdir -p "$LOG_DIR" "$PID_DIR"
+    "$BIN" --model generic > "$LOGFILE" 2>&1 &
+    echo $! > "$PIDFILE"
+    sleep 8
+    if kill -0 "$(cat "$PIDFILE")" 2>/dev/null \
+       && curl -s --max-time 5 -o /dev/null http://127.0.0.1:8788/v1/models; then
+        echo "[✓] mimo2codex started (PID: $(cat "$PIDFILE")) via tunnel 127.0.0.1:$_wg_port"
+        return 0
+    fi
+    echo "[✗] Failed to start — check $LOGFILE"
+    tail -5 "$LOGFILE" 2>/dev/null
+    return 1
+}
+
+do_stop() {
+    if [ -f "$PIDFILE" ]; then
+        kill "$(cat "$PIDFILE")" 2>/dev/null
+        rm -f "$PIDFILE"
+    fi
+    pkill -f "mimo2codex --model generic" 2>/dev/null || true
+    echo "[✓] mimo2codex stopped (:8788)"
+}
+
+tunnel_up() {
+    _s="$STUDIO/wgtunnel/wireproxy"
+    [ -f "$_s/active.pid" ] && kill -0 "$(cat "$_s/active.pid")" 2>/dev/null
+}
+
+case "${1:-status}" in
+    restart)
+        # Check FIRST so a refuse never kills a running instance.
+        if ! tunnel_up; then
+            echo "[✗] Tunnel is DOWN — start it first (leaving running instance untouched)"
+            exit 1
+        fi
+        do_stop >/dev/null 2>&1
+        sleep 1
+        do_start
+        ;;
+    start)
+        do_start
+        ;;
+    stop)
+        do_stop
+        ;;
+    status)
+        if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+            echo "[✓] mimo2codex is running (PID: $(cat "$PIDFILE"))"
+            curl -s --max-time 5 http://127.0.0.1:8788/v1/models | head -c 200
+            echo ""
+        else
+            echo "[✗] mimo2codex is not running"
+        fi
+        ;;
+    *)
+        echo "Usage: mimo2codex-zen {start|stop|restart|status}"
+        echo "  :8788 Codex CLI -> Kilo gateway, upstream via WG tunnel (stable 127.0.0.1:18104), fail-closed"
+        ;;
+esac
