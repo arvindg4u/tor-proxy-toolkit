@@ -1,58 +1,92 @@
 #!/bin/bash
+# Single zen instance on :4013. ALL upstream traffic (opencode.ai:443) goes
+# via the WG tunnel (stable 127.0.0.1:18104), scoped to this process only —
+# nothing global, no system exports.
+# Fail-closed: refuses to start when the tunnel is down, so traffic can never
+# silently leak direct.
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 PID_DIR="/tmp/tor-toolkit-pids"
 LOG_DIR="${HOME}/.claude/zen-logs"
+PIDFILE="$PID_DIR/claude-proxy.pid"
+LOGFILE="$LOG_DIR/claude-proxy.log"
+
+do_start() {
+    cd "$SCRIPT_DIR/claude-code-proxy"
+    export OPENAI_API_KEY="$(grep '^OPENAI_API_KEY=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2-)"
+    export OPENAI_BASE_URL="$(grep '^OPENAI_BASE_URL=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2-)"
+    export BIG_MODEL="$(grep '^BIG_MODEL=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2-)"
+    export MIDDLE_MODEL="$(grep '^MIDDLE_MODEL=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2-)"
+    export SMALL_MODEL="$(grep '^SMALL_MODEL=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2-)"
+    export PORT=4013
+    export LOG_LEVEL="WARNING"
+    export MAX_TOKENS_LIMIT="128000"
+    # Studio-local vendored deps (pool sandbox: no venvs allowed). On a
+    # normal machine this dir doesn't exist — harmless, requirements.txt
+    # covers it. Kept conditional so one script works everywhere.
+    if [ -d "$SCRIPT_DIR/.libs" ]; then
+        export PYTHONPATH="$SCRIPT_DIR/.libs${PYTHONPATH:+:$PYTHONPATH}"
+    fi
+    # Tunnel upstream (process-scoped). httpx honors proxy env; NO_PROXY in
+    # ~/.claude/settings.json covers only localhost, so zen->127.0.0.1 stays
+    # direct while zen->opencode.ai goes via the tunnel.
+    _wg_state="$SCRIPT_DIR/../wgtunnel/wireproxy"
+    _wg_port="$(cat "$_wg_state/stable.port" 2>/dev/null || echo 18104)"
+    if [ ! -f "$_wg_state/active.pid" ] \
+       || ! kill -0 "$(cat "$_wg_state/active.pid")" 2>/dev/null; then
+        echo "[✗] Tunnel is DOWN — start it first: wg-user restart"
+        echo "    (fail-closed: refusing direct upstream so nothing leaks)"
+        return 1
+    fi
+    export HTTP_PROXY="http://127.0.0.1:$_wg_port" HTTPS_PROXY="http://127.0.0.1:$_wg_port"
+    export http_proxy="$HTTP_PROXY" https_proxy="$HTTPS_PROXY"
+    mkdir -p "$LOG_DIR" "$PID_DIR"
+    python3 start_proxy.py > "$LOGFILE" 2>&1 &
+    echo $! > "$PIDFILE"
+    sleep 2
+    if kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+        echo "[✓] Claude Zen proxy started (PID: $(cat "$PIDFILE")) via tunnel 127.0.0.1:$_wg_port"
+        return 0
+    fi
+    echo "[✗] Failed to start — check $LOGFILE"
+    tail -3 "$LOGFILE" 2>/dev/null
+    return 1
+}
+
+do_stop() {
+    if [ -f "$PIDFILE" ]; then
+        kill "$(cat "$PIDFILE")" 2>/dev/null
+        rm -f "$PIDFILE"
+    fi
+    pkill -f "start_proxy.py" 2>/dev/null || true
+    echo "[✓] Claude Zen proxy stopped (:4013)"
+}
+
+tunnel_up() {
+    _s="$SCRIPT_DIR/../wgtunnel/wireproxy"
+    [ -f "$_s/active.pid" ] && kill -0 "$(cat "$_s/active.pid")" 2>/dev/null
+}
 
 case "${1:-status}" in
     restart)
-        if [ -f "$PID_DIR/claude-proxy.pid" ] && kill -0 "$(cat $PID_DIR/claude-proxy.pid)" 2>/dev/null; then
-            $0 stop 2>/dev/null
-        fi
-        $0 start
-        ;;
-    start)
-        cd "$SCRIPT_DIR/claude-code-proxy"
-        export OPENAI_API_KEY="$(grep '^OPENAI_API_KEY=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2-)"
-        export OPENAI_BASE_URL="$(grep '^OPENAI_BASE_URL=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2-)"
-        export BIG_MODEL="$(grep '^BIG_MODEL=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2-)"
-        export MIDDLE_MODEL="$(grep '^MIDDLE_MODEL=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2-)"
-        export SMALL_MODEL="$(grep '^SMALL_MODEL=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2-)"
-        export PORT=4013
-        export LOG_LEVEL="WARNING"
-        export MAX_TOKENS_LIMIT="128000"
-        # Studio-local vendored deps (pool sandbox: no venvs allowed). On a
-        # normal machine this dir doesn't exist — harmless, requirements.txt
-        # covers it. Kept conditional so one script works everywhere.
-        if [ -d "$SCRIPT_DIR/.libs" ]; then
-            export PYTHONPATH="$SCRIPT_DIR/.libs${PYTHONPATH:+:$PYTHONPATH}"
-        fi
-        # Direct upstream: never route via WG tunnel.
-        unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy
-        mkdir -p "$LOG_DIR" "$PID_DIR"
-        python3 start_proxy.py > "$LOG_DIR/claude-proxy.log" 2>&1 &
-        echo $! > "$PID_DIR/claude-proxy.pid"
-        sleep 2
-        if kill -0 "$(cat $PID_DIR/claude-proxy.pid)" 2>/dev/null; then
-            echo "[✓] Claude Zen proxy started (PID: $(cat $PID_DIR/claude-proxy.pid))"
-        else
-            echo "[✗] Failed to start — check $LOG_DIR/claude-proxy.log"
-            tail -3 "$LOG_DIR/claude-proxy.log" 2>/dev/null
+        # Check FIRST so a refuse never kills a running instance.
+        if ! tunnel_up; then
+            echo "[✗] Tunnel is DOWN — start it first: wg-user restart"
+            echo "    (leaving running instance untouched)"
             exit 1
         fi
+        do_stop >/dev/null 2>&1
+        sleep 1
+        do_start
+        ;;
+    start)
+        do_start
         ;;
     stop)
-        pidfile="$PID_DIR/claude-proxy.pid"
-        if [ -f "$pidfile" ]; then
-            kill "$(cat $pidfile)" 2>/dev/null
-            rm -f "$pidfile"
-        fi
-        pkill -f "start_proxy.py" 2>/dev/null || true
-        echo "[✓] Claude Zen proxy stopped"
+        do_stop
         ;;
     status)
-        pidfile="$PID_DIR/claude-proxy.pid"
-        if [ -f "$pidfile" ] && kill -0 "$(cat $pidfile)" 2>/dev/null; then
-            echo "[✓] Claude Zen proxy is running (PID: $(cat $pidfile))"
+        if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+            echo "[✓] Claude Zen proxy is running (PID: $(cat "$PIDFILE"))"
             curl -s http://127.0.0.1:4013/health | python3 -m json.tool 2>/dev/null
         else
             echo "[✗] Claude Zen proxy is not running"
@@ -60,5 +94,6 @@ case "${1:-status}" in
         ;;
     *)
         echo "Usage: claude-zen {start|stop|restart|status}"
+        echo "  :4013, upstream via WG tunnel (stable 127.0.0.1:18104), fail-closed"
         ;;
 esac
