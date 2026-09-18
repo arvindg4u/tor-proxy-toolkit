@@ -8,6 +8,7 @@ from typing import Any, AsyncGenerator, Dict, Optional
 import httpx
 from fastapi import HTTPException
 
+from src.core.config import config
 from src.core.guards import scrub_api_keys
 from src.core.http_client import get_shared_client, get_stream_timeout
 
@@ -120,6 +121,10 @@ class ResponsesClient:
     def _url(self) -> str:
         return f"{self.base_url}/responses"
 
+    def _request_headers(self) -> Dict[str, str]:
+        """Per-call headers: fresh CLI identity (msg id) over the base set."""
+        return {**self.headers, **config.get_upstream_headers()}
+
     @staticmethod
     def _dump_failure(
         status: int,
@@ -187,7 +192,7 @@ class ResponsesClient:
                     resp = await client.post(
                         self._url(),
                         json=payload,
-                        headers=self.headers,
+                        headers=self._request_headers(),
                         timeout=self.timeout,
                     )
                     if resp.status_code >= 400:
@@ -280,7 +285,7 @@ class ResponsesClient:
                         "POST",
                         self._url(),
                         json=body,
-                        headers=self.headers,
+                        headers=self._request_headers(),
                         timeout=get_stream_timeout(),
                     ) as resp:
                             if resp.status_code >= 400:

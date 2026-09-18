@@ -90,14 +90,24 @@ def test_round_trip():
 
 
 def test_responses_request_uses_aliases():
+    from src.core.cli_identity import GENUINE_CLI_TOOLS
+
     req = _request_with_tools(["search", LONG_CODE, LONG_SEARCH])
     out = convert_claude_to_responses(req, StubModelManager())
     names = [t["name"] for t in out["tools"]]
-    assert "search" in names
-    assert LONG_CODE not in names and LONG_SEARCH not in names
-    assert all(len(n) <= MAX_TOOL_NAME_LEN and VALID.match(n) for n in names), names
+    # Free-tier gate: the genuine CLI manifest goes first, then the
+    # caller's (aliased) tools.
+    assert names[: len(GENUINE_CLI_TOOLS)] == [
+        t["name"] for t in GENUINE_CLI_TOOLS
+    ]
+    caller_names = names[len(GENUINE_CLI_TOOLS):]
+    assert "search" in caller_names
+    assert LONG_CODE not in caller_names and LONG_SEARCH not in caller_names
+    assert all(
+        len(n) <= MAX_TOOL_NAME_LEN and VALID.match(n) for n in caller_names
+    ), caller_names
     # Upstream echo resolves back to the Claude-side names.
-    assert {from_upstream_name(n) for n in names} == {
+    assert {from_upstream_name(n) for n in caller_names} == {
         "search",
         LONG_CODE,
         LONG_SEARCH,

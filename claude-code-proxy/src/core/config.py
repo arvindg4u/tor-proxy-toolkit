@@ -1,6 +1,8 @@
 import os
 import sys
 
+from src.core.cli_identity import new_message_id
+
 
 def _new_session_id():
     """Generate an OpenCode-style session id (ses_ + 24 alphanumerics)."""
@@ -51,7 +53,7 @@ class Config:
 
         # Upstream User-Agent. ZEN rate-limits by UA: only opencode client UAs
         # get the normal free tier, everything else is treated as bot traffic.
-        self.upstream_user_agent = os.environ.get("UPSTREAM_USER_AGENT", "opencode/1.18.29")
+        self.upstream_user_agent = os.environ.get("UPSTREAM_USER_AGENT", "opencode/1.18.31")
 
         # OpenCode client identity headers. ZEN's free tier rejects requests
         # without x-opencode-session ("MissingSessionID: free tier can only
@@ -125,7 +127,13 @@ class Config:
         return custom_headers
 
     def get_upstream_headers(self):
-        """OpenCode identity headers sent upstream with every ZEN request."""
+        """OpenCode identity headers sent upstream with every ZEN request.
+
+        A fresh ``x-opencode-request`` message id is minted on every call:
+        the free-tier gate expects the header present in CLI (``msg_``)
+        format. The session id stays pinned (set OPENCODE_SESSION_ID to a
+        genuine CLI-generated ``ses_`` id -- values are reusable).
+        """
         headers = {"User-Agent": self.upstream_user_agent}
         if self.opencode_session_id:
             headers["x-opencode-session"] = self.opencode_session_id
@@ -133,8 +141,9 @@ class Config:
             headers["x-opencode-project"] = self.opencode_project_id
         if self.opencode_client:
             headers["x-opencode-client"] = self.opencode_client
-        if self.opencode_user_id:
-            headers["x-opencode-request"] = self.opencode_user_id
+        headers["x-opencode-request"] = (
+            self.opencode_user_id or new_message_id()
+        )
         return headers
 
 try:

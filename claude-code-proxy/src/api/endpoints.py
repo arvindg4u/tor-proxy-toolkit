@@ -23,6 +23,7 @@ from src.conversion.response_converter import (
     convert_openai_streaming_to_claude_with_cancellation,
 )
 from src.conversion.response_responses import (
+    _split_event,
     convert_responses_to_claude_response,
     convert_responses_streaming_to_claude_with_cancellation,
 )
@@ -172,6 +173,11 @@ async def _handle_responses_message(request: ClaudeMessagesRequest, http_request
     responses_request = convert_claude_to_responses(request, model_manager)
     stats.note_model(responses_request.get("model"))
 
+    # Free-tier gate rejects stream:false upstream (FreeTierError) even when
+    # everything else matches, so always stream upstream. Non-streaming
+    # clients get a de-streamed single response below.
+    responses_request["stream"] = True
+
     # Check if client disconnected before processing
     if await http_request.is_disconnected():
         raise HTTPException(status_code=499, detail="Client disconnected")
@@ -204,12 +210,133 @@ async def _handle_responses_message(request: ClaudeMessagesRequest, http_request
                 },
             )
     else:
-        responses_object = await responses_client.create_response(
-            responses_request, request_id
+        # Non-streaming client: stream upstream (gate requirement), then
+        # accumulate the SSE events into one Responses object and convert.
+        responses_object = await _collect_streamed_response(
+            responses_client, responses_request, request_id, http_request
         )
         usage = responses_object.get("usage") if isinstance(responses_object, dict) else None
         stats.record("/v1/messages", status=200, latency=time.monotonic() - t0, usage=usage)
         return convert_responses_to_claude_response(responses_object, request)
+
+
+async def _collect_streamed_response(
+    responses_client, payload: dict, request_id: str, http_request: Request
+) -> dict:
+    """Stream a Responses request upstream and accumulate one response object.
+
+    Used for non-streaming clients: the free-tier gate rejects ``stream:false``
+    upstream, so we always stream and assemble the result here. Prefers the
+    authoritative ``response.completed`` payload; falls back to assembling
+    from deltas when the stream ends without one.
+    """
+    text_parts: list = []
+    thinking_parts: list = []
+    func_calls: dict = {}
+    func_order: list = []
+    usage: dict = {}
+    status = "completed"
+    resp_id: str | None = None
+    gen = responses_client.create_response_stream(payload, request_id)
+    try:
+        async for raw_event in gen:
+            if await http_request.is_disconnected():
+                responses_client.cancel_request(request_id)
+                raise HTTPException(status_code=499, detail="Client disconnected")
+            event_type, data = _split_event(raw_event)
+            if data is None:
+                continue
+            if event_type == "response.output_text.delta":
+                if data.get("delta"):
+                    text_parts.append(data["delta"])
+            elif event_type == "response.reasoning_summary_text.delta":
+                if data.get("delta"):
+                    thinking_parts.append(data["delta"])
+            elif event_type == "response.output_item.added":
+                item = data.get("item", {}) or {}
+                if item.get("type") == "function_call":
+                    iid = item.get("id") or item.get("call_id") or f"fc_{uuid.uuid4().hex[:12]}"
+                    if iid not in func_calls:
+                        func_calls[iid] = {
+                            "id": item.get("call_id") or item.get("id") or iid,
+                            "name": item.get("name", ""),
+                            "args": item.get("arguments") or "",
+                        }
+                        func_order.append(iid)
+                    elif item.get("arguments"):
+                        func_calls[iid]["args"] = item["arguments"]
+            elif event_type == "response.function_call_arguments.delta":
+                iid = data.get("item_id", "")
+                frag = data.get("delta", "")
+                if iid and frag:
+                    entry = func_calls.setdefault(
+                        iid, {"id": iid, "name": "", "args": ""}
+                    )
+                    if iid not in func_order:
+                        func_order.append(iid)
+                    entry["args"] += frag
+            elif event_type in (
+                "response.function_call_arguments.done",
+                "response.output_item.done",
+            ):
+                item = data.get("item") if event_type == "response.output_item.done" else None
+                if isinstance(item, dict) and item.get("type") == "function_call":
+                    iid = item.get("id") or item.get("call_id", "")
+                    entry = func_calls.get(iid)
+                    if entry is not None and item.get("arguments"):
+                        entry["args"] = item["arguments"]
+                elif event_type == "response.function_call_arguments.done":
+                    iid = data.get("item_id", "")
+                    entry = func_calls.get(iid)
+                    if entry is not None and data.get("arguments"):
+                        entry["args"] = data["arguments"]
+            elif event_type == "response.completed":
+                response = data.get("response", {}) or {}
+                # Authoritative full object: use it directly.
+                return response
+            elif event_type == "response.failed":
+                raise HTTPException(
+                    status_code=500, detail="Upstream response failed"
+                )
+    finally:
+        aclose = getattr(gen, "aclose", None)
+        if aclose is not None:
+            try:
+                await aclose()
+            except Exception:
+                pass
+    output: list = []
+    if thinking_parts:
+        output.append(
+            {
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "".join(thinking_parts)}],
+            }
+        )
+    if text_parts:
+        output.append(
+            {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "".join(text_parts)}],
+            }
+        )
+    for iid in func_order:
+        entry = func_calls[iid]
+        output.append(
+            {
+                "type": "function_call",
+                "id": entry["id"],
+                "call_id": entry["id"],
+                "name": entry["name"],
+                "arguments": entry["args"],
+            }
+        )
+    return {
+        "id": resp_id or f"resp_{uuid.uuid4().hex[:12]}",
+        "output": output,
+        "usage": usage,
+        "status": status,
+    }
 
 
 @router.post("/v1/messages/count_tokens")

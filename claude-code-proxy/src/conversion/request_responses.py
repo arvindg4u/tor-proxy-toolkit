@@ -12,6 +12,7 @@ from typing import Any, Dict, List
 
 from src.core.constants import Constants
 from src.core.config import config
+from src.core.cli_identity import GENUINE_CLI_TOOLS, prepend_cli_preamble
 from src.conversion.tool_names import to_upstream_name
 from src.models.claude import ClaudeMessagesRequest, ClaudeMessage
 
@@ -33,7 +34,9 @@ def convert_claude_to_responses(
     if instructions:
         responses_request["instructions"] = instructions
 
-    # Messages -> input items
+    # Messages -> input items. Whether the genuine CLI developer preamble is
+    # prepended depends on tools (see below): title-dev + tools is an
+    # incoherent combo the gate rejects, so the two shapes are exclusive.
     responses_request["input"] = _convert_messages(claude_request.messages)
 
     # Token budget: clamp like the chat path, then apply the responses floor
@@ -67,8 +70,14 @@ def convert_claude_to_responses(
 
     # Tools: flatten to function tools (ZEN/Muse Spark rejects
     # custom/namespace tool types — same fix as mimo2codex).
+    #
+    # Free-tier gate, tool-carrying turns (verified 2026-09-18): foreign or
+    # partial tool sets get FreeTierError; only the full genuine 27-tool CLI
+    # manifest (with the caller's tools appended) passes -- and only WITHOUT
+    # the developer preamble (title-dev + tools is an incoherent combo the
+    # gate also rejects). See src/core/cli_identity.py.
+    responses_tools = []
     if claude_request.tools:
-        responses_tools = []
         for tool in claude_request.tools:
             if tool.name and tool.name.strip():
                 parameters = tool.input_schema or {}
@@ -86,8 +95,13 @@ def convert_claude_to_responses(
                         "parameters": parameters,
                     }
                 )
-        if responses_tools:
-            responses_request["tools"] = responses_tools
+    if responses_tools:
+        responses_request["tools"] = [*GENUINE_CLI_TOOLS, *responses_tools]
+    else:
+        # Tool-less turn: title-shape with the genuine CLI developer preamble.
+        responses_request["input"] = prepend_cli_preamble(
+            responses_request["input"]
+        )
 
     # Tool choice
     # Tool choice: this upstream accepts ONLY "auto" — "none",
