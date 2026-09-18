@@ -1,0 +1,67 @@
+#!/bin/bash
+# Smart forward proxy on :18090 with automatic tunnel/direct failover.
+# Clients point here ALWAYS; per request it forwards via the WG tunnel
+# (stable 127.0.0.1:18104) when healthy, else goes direct. No restarts,
+# no config changes on tunnel state flips.
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+STUDIO="$(cd "$SCRIPT_DIR/.." && pwd)"
+PID_DIR="/tmp/tor-toolkit-pids"
+LOG_DIR="${HOME}/.claude/zen-logs"
+PIDFILE="$PID_DIR/smart-proxy.pid"
+LOGFILE="$LOG_DIR/smart-proxy-18090.log"
+
+do_start() {
+    export SMART_LISTEN="127.0.0.1:18090"
+    export SMART_UPSTREAM="127.0.0.1:18104"
+    export SMART_PIDFILE="$STUDIO/wgtunnel/wireproxy/active.pid"
+    mkdir -p "$LOG_DIR" "$PID_DIR"
+    python3 "$SCRIPT_DIR/smart-proxy/smart-proxy.py" > "$LOGFILE" 2>&1 &
+    echo $! > "$PIDFILE"
+    sleep 2
+    # Liveness = TCP accept on :18090 (plain connect, no HTTP — avoids
+    # depending on request handling for the boot check).
+    if kill -0 "$(cat "$PIDFILE")" 2>/dev/null \
+       && timeout 5 bash -c 'echo > /dev/tcp/127.0.0.1/18090' 2>/dev/null; then
+        echo "[✓] smart-proxy started (PID: $(cat "$PIDFILE")) :18090 -> tunnel :18104 w/ direct fallback"
+        return 0
+    fi
+    echo "[✗] Failed to start — check $LOGFILE"
+    tail -5 "$LOGFILE" 2>/dev/null
+    return 1
+}
+
+do_stop() {
+    if [ -f "$PIDFILE" ]; then
+        kill "$(cat "$PIDFILE")" 2>/dev/null
+        rm -f "$PIDFILE"
+    fi
+    pkill -f "smart-proxy/smart-proxy.py" 2>/dev/null || true
+    echo "[✓] smart-proxy stopped (:18090)"
+}
+
+case "${1:-status}" in
+    restart)
+        do_stop >/dev/null 2>&1
+        sleep 1
+        do_start
+        ;;
+    start)
+        do_start
+        ;;
+    stop)
+        do_stop
+        ;;
+    status)
+        if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+            echo "[✓] smart-proxy is running (PID: $(cat "$PIDFILE"))"
+            curl -s --max-time 5 -x http://127.0.0.1:18090 https://ifconfig.me 2>/dev/null
+            echo " <- current egress (tunnel IP = via tunnel, else direct)"
+        else
+            echo "[✗] smart-proxy is not running"
+        fi
+        ;;
+    *)
+        echo "Usage: smart-proxy-zen {start|stop|restart|status}"
+        echo "  :18090 forward proxy, tunnel :18104 when healthy else direct"
+        ;;
+esac
