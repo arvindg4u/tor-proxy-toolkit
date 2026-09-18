@@ -131,6 +131,7 @@ class ResponsesClient:
         error: str,
         model: Optional[str] = None,
         request_id: Optional[str] = None,
+        ttl: Optional[str] = None,
     ) -> None:
         """Save a compact failure record locally for diagnosis.
 
@@ -152,6 +153,7 @@ class ResponsesClient:
                         "error": scrub_api_keys(error or "")[:2000],
                         "model": model,
                         "request_id": request_id,
+                        "cache_ttl": ttl,
                         "at": _time.time(),
                     },
                     f,

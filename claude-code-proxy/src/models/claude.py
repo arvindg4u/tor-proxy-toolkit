@@ -1,24 +1,33 @@
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional, Union, Literal
 
+class ClaudeCacheControl(BaseModel):
+    """P5: prompt-cache breakpoint. ttl "1h" needs extended-cache-ttl beta."""
+    type: Literal["ephemeral"] = "ephemeral"
+    ttl: Optional[str] = None
+
 class ClaudeContentBlockText(BaseModel):
     type: Literal["text"]
     text: str
+    cache_control: Optional[ClaudeCacheControl] = None
 
 class ClaudeContentBlockImage(BaseModel):
     type: Literal["image"]
     source: Dict[str, Any]
+    cache_control: Optional[ClaudeCacheControl] = None
 
 class ClaudeContentBlockToolUse(BaseModel):
     type: Literal["tool_use"]
     id: str
     name: str
     input: Dict[str, Any]
+    cache_control: Optional[ClaudeCacheControl] = None
 
 class ClaudeContentBlockToolResult(BaseModel):
     type: Literal["tool_result"]
     tool_use_id: str
     content: Union[str, List[Dict[str, Any]], Dict[str, Any]]
+    cache_control: Optional[ClaudeCacheControl] = None
 
 class ClaudeContentBlockThinking(BaseModel):
     """Thinking block echoed back in history (incl. proxy-emitted ones,
@@ -31,10 +40,12 @@ class ClaudeContentBlockThinking(BaseModel):
 class ClaudeContentBlockRedactedThinking(BaseModel):
     type: Literal["redacted_thinking"]
     data: str = ""
+    cache_control: Optional[ClaudeCacheControl] = None
 
 class ClaudeSystemContent(BaseModel):
     type: Literal["text"]
     text: str
+    cache_control: Optional[ClaudeCacheControl] = None
 
 class ClaudeMessage(BaseModel):
     role: Literal["user", "assistant", "system"]
@@ -44,6 +55,7 @@ class ClaudeTool(BaseModel):
     name: str
     description: Optional[str] = None
     input_schema: Dict[str, Any]
+    cache_control: Optional[ClaudeCacheControl] = None
 
 class ClaudeThinkingConfig(BaseModel):
     type: str = "enabled"

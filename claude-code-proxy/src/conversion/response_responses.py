@@ -12,6 +12,8 @@ from src.core.config import config
 from src.core.constants import Constants
 from src.conversion.tool_names import from_upstream_name
 from src.core.stats import request_usage_key, stats
+from src.core.cache_ttl import effective_ttl as _effective_ttl
+from src.core.config import config as _config
 from src.models.claude import ClaudeMessagesRequest
 
 
@@ -312,7 +314,7 @@ async def convert_responses_streaming_to_claude_with_cancellation(
                     _now = time.monotonic()
                     if _first_token_at is None:
                         _first_token_at = _now
-                        stats.record_ttft(_now - _stream_t0)
+                        stats.record_ttft(_now - _stream_t0, session_key=usage_key)
                         logger.debug(
                             "Stream %s TTFT client=%.1fms",
                             request_id,
@@ -409,7 +411,7 @@ async def convert_responses_streaming_to_claude_with_cancellation(
                     has_function_call = True
                     if _first_token_at is None:
                         _first_token_at = time.monotonic()
-                        stats.record_ttft(_first_token_at - _stream_t0)
+                        stats.record_ttft(_first_token_at - _stream_t0, session_key=usage_key)
                     _prev_token_at = time.monotonic()
                     yield _sse(
                         Constants.EVENT_CONTENT_BLOCK_START,
@@ -626,7 +628,12 @@ async def convert_responses_streaming_to_claude_with_cancellation(
     # Streaming requests only count hits in endpoints.py — feed the final
     # usage (incl. cache hits) into stats here so tokens aren't invisible.
     # Also snapshots it as the next turn's message_start base.
-    stats.add_tokens(usage_data, key=usage_key)
+    stats.add_tokens(
+        usage_data,
+        key=usage_key,
+        model=original_request.model,
+        ttl=_effective_ttl(original_request, getattr(_config, "cache_ttl_default", "5m")),
+    )
 
     # Flush any function call that never got an explicit done event
     # (only the unsent tail — fragments already streamed above).

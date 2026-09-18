@@ -82,8 +82,18 @@ class Config:
         # Reasoning upstreams can go silent for minutes; Claude Code shows
         # "Waiting for API response" after ~20s of no bytes and aborts the
         # stream at its idle watchdogs. Periodic ping events reset those
-        # timers. 0 disables.
+        # timers. 0 disables. Note: this is byte-level liveness only, it
+        # does not extend prompt-cache TTL (cache hits need a real request
+        # inside the 5m/1h window).
         self.stream_keepalive_secs = float(os.environ.get("STREAM_KEEPALIVE_SECS", "15"))
+
+        # P5: default cache TTL when the client sets no breakpoint.
+        # "5m" matches current Anthropic default; set "1h" only if your
+        # upstream honors extended TTL (otherwise cost would understate).
+        self.cache_ttl_default = os.environ.get("CACHE_TTL_DEFAULT", "5m").strip().lower()
+        if self.cache_ttl_default not in ("5m", "1h"):
+            print(f"Warning: unknown CACHE_TTL_DEFAULT '{self.cache_ttl_default}', falling back to '5m'.")
+            self.cache_ttl_default = "5m"
         
     def validate_api_key(self):
         """Basic API key validation"""

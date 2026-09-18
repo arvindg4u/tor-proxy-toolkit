@@ -344,33 +344,17 @@ async def count_tokens(request: ClaudeTokenCountRequest, http_request: Request, 
     if body_too_large(http_request.headers, MAX_COUNT_TOKENS_BODY_BYTES):
         raise HTTPException(status_code=413, detail="Request body too large")
     try:
-        # For token counting, we'll use a simple estimation
-        # In a real implementation, you might want to use tiktoken or similar
+        # Accurate estimator (text extraction + images + thinking budget +
+        # tiktoken when installed, heuristic otherwise).
+        from src.core.tokens import estimate_input_tokens
 
-        total_chars = 0
-
-        # Count system message characters
-        if request.system:
-            if isinstance(request.system, str):
-                total_chars += len(request.system)
-            elif isinstance(request.system, list):
-                for block in request.system:
-                    if hasattr(block, "text"):
-                        total_chars += len(block.text)
-
-        # Count message characters
-        for msg in request.messages:
-            if msg.content is None:
-                continue
-            elif isinstance(msg.content, str):
-                total_chars += len(msg.content)
-            elif isinstance(msg.content, list):
-                for block in msg.content:
-                    if hasattr(block, "text") and block.text is not None:
-                        total_chars += len(block.text)
-
-        # Rough estimation: 4 characters per token
-        estimated_tokens = max(1, total_chars // 4)
+        estimated_tokens = estimate_input_tokens(
+            model=getattr(request, "model", None),
+            system=request.system,
+            messages=request.messages,
+            tools=request.tools,
+            thinking=request.thinking,
+        )
 
         return {"input_tokens": estimated_tokens}
 

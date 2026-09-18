@@ -5,6 +5,8 @@ from fastapi import HTTPException, Request
 from src.core.constants import Constants
 from src.conversion.tool_names import from_upstream_name
 from src.core.stats import request_usage_key, stats
+from src.core.cache_ttl import effective_ttl as _effective_ttl
+from src.core.config import config as _config
 from src.models.claude import ClaudeMessagesRequest
 
 
@@ -55,6 +57,21 @@ def convert_openai_to_claude_response(
     # Build Claude content blocks
     content_blocks = []
 
+    # P6: reasoning -> thinking block (non-streaming parity with responses
+    # path). Shown only when the request enabled thinking; otherwise the
+    # reasoning text is dropped (upstream-internal).
+    _thinking = getattr(original_request, "thinking", None)
+    _want_thinking = bool(_thinking is not None and getattr(_thinking, "type", None) == "enabled")
+    reasoning_text = (
+        message.get("reasoning_content")
+        or message.get("reasoning")
+        or message.get("thinking")
+    )
+    if reasoning_text and _want_thinking:
+        content_blocks.append(
+            {"type": "thinking", "thinking": str(reasoning_text), "signature": ""}
+        )
+
     # Add text content
     text_content = message.get("content")
     if text_content is not None:
@@ -93,7 +110,11 @@ def convert_openai_to_claude_response(
         "function_call": Constants.STOP_TOOL_USE,
     }.get(finish_reason, Constants.STOP_END_TURN)
 
-    # Build Claude response
+    # Build Claude response (preserve cache hits so the next turn's
+    # message_start base doesn't lose them).
+    _oa_usage = openai_response.get("usage", {}) or {}
+    _oa_details = _oa_usage.get("prompt_tokens_details", {}) or {}
+    _cache_read = int(_oa_details.get("cached_tokens", 0) or 0)
     claude_response = {
         "id": openai_response.get("id", f"msg_{uuid.uuid4()}"),
         "type": "message",
@@ -103,10 +124,10 @@ def convert_openai_to_claude_response(
         "stop_reason": stop_reason,
         "stop_sequence": None,
         "usage": {
-            "input_tokens": openai_response.get("usage", {}).get("prompt_tokens", 0),
-            "output_tokens": openai_response.get("usage", {}).get(
-                "completion_tokens", 0
-            ),
+            "input_tokens": _oa_usage.get("prompt_tokens", 0),
+            "output_tokens": _oa_usage.get("completion_tokens", 0),
+            "cache_read_input_tokens": _cache_read,
+            "cache_creation_input_tokens": 0,
         },
     }
 
@@ -141,6 +162,12 @@ async def convert_openai_streaming_to_claude(
     tool_block_counter = 0
     current_tool_calls = {}
     final_stop_reason = Constants.STOP_END_TURN
+    usage_data = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+    }
 
     try:
         async for item in openai_stream:
@@ -149,6 +176,15 @@ async def convert_openai_streaming_to_claude(
                 break
             if kind != "chunk":
                 continue
+            usage = chunk.get("usage", None)
+            if usage:
+                prompt_details = usage.get("prompt_tokens_details", {}) or {}
+                usage_data = {
+                    "input_tokens": usage.get("prompt_tokens", 0),
+                    "output_tokens": usage.get("completion_tokens", 0),
+                    "cache_read_input_tokens": prompt_details.get("cached_tokens", 0),
+                    "cache_creation_input_tokens": 0,
+                }
             choices = chunk.get("choices", [])
             if not choices:
                 continue
@@ -240,7 +276,12 @@ async def convert_openai_streaming_to_claude(
         return
 
     # Send final SSE events
-    stats.add_tokens(usage_data, key=usage_key)
+    stats.add_tokens(
+        usage_data,
+        key=usage_key,
+        model=original_request.model,
+        ttl=_effective_ttl(original_request, getattr(_config, "cache_ttl_default", "5m")),
+    )
     # Backstop: flush any tool-args tail that arrived before its block
     # started (or after the last incremental forward).
     for tool_data in current_tool_calls.values():
@@ -255,7 +296,6 @@ async def convert_openai_streaming_to_claude(
         if tool_data.get("started") and tool_data.get("claude_index") is not None:
             yield f"event: {Constants.EVENT_CONTENT_BLOCK_STOP}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_STOP, 'index': tool_data['claude_index']}, ensure_ascii=False)}\n\n"
 
-    usage_data = {"input_tokens": 0, "output_tokens": 0}
     yield f"event: {Constants.EVENT_MESSAGE_DELTA}\ndata: {json.dumps({'type': Constants.EVENT_MESSAGE_DELTA, 'delta': {'stop_reason': final_stop_reason, 'stop_sequence': None}, 'usage': usage_data}, ensure_ascii=False)}\n\n"
     yield f"event: {Constants.EVENT_MESSAGE_STOP}\ndata: {json.dumps({'type': Constants.EVENT_MESSAGE_STOP}, ensure_ascii=False)}\n\n"
 
@@ -290,7 +330,20 @@ async def convert_openai_streaming_to_claude_with_cancellation(
     tool_block_counter = 0
     current_tool_calls = {}
     final_stop_reason = Constants.STOP_END_TURN
-    usage_data = {"input_tokens": 0, "output_tokens": 0}
+    # P6: thinking display on the chat path. Upstream reasoning models
+    # stream reasoning_content deltas with no visible text; without a
+    # thinking block the CLI shows a frozen spinner. Same index scheme as
+    # the responses path (thinking shares tool_block_counter).
+    _thinking_cfg = getattr(original_request, "thinking", None)
+    want_thinking = bool(_thinking_cfg is not None and getattr(_thinking_cfg, "type", None) == "enabled")
+    thinking_index: int | None = None
+    thinking_open = False
+    usage_data = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+    }
 
     try:
         async for item in openai_stream:
@@ -309,28 +362,56 @@ async def convert_openai_streaming_to_claude_with_cancellation(
             usage = chunk.get("usage", None)
             if usage:
                 cache_read_input_tokens = 0
-                prompt_tokens_details = usage.get('prompt_tokens_details', {})
+                prompt_tokens_details = usage.get('prompt_tokens_details', {}) or {}
                 if prompt_tokens_details:
                     cache_read_input_tokens = prompt_tokens_details.get('cached_tokens', 0)
                 usage_data = {
                     'input_tokens': usage.get('prompt_tokens', 0),
                     'output_tokens': usage.get('completion_tokens', 0),
-                    'cache_read_input_tokens': cache_read_input_tokens
+                    'cache_read_input_tokens': cache_read_input_tokens,
+                    'cache_creation_input_tokens': 0,
                 }
             choices = chunk.get("choices", [])
             if not choices:
                 continue
 
             choice = choices[0]
-            delta = choice.get("delta", {})
+            delta = choice.get("delta", {}) or {}
             finish_reason = choice.get("finish_reason")
+
+            # P6: reasoning deltas -> Claude thinking block (chat path).
+            reasoning_text = (
+                delta.get("reasoning_content")
+                or delta.get("reasoning")
+                or delta.get("thinking")
+            )
+            if reasoning_text and want_thinking:
+                if not thinking_open:
+                    tool_block_counter += 1
+                    thinking_index = text_block_index + tool_block_counter
+                    thinking_open = True
+                    yield f"event: {Constants.EVENT_CONTENT_BLOCK_START}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_START, 'index': thinking_index, 'content_block': {'type': 'thinking', 'thinking': '', 'signature': ''}}, ensure_ascii=False)}\n\n"
+                _now = time.monotonic()
+                if _first_token_at is None:
+                    _first_token_at = _now
+                    stats.record_ttft(_now - _stream_t0, session_key=usage_key)
+                elif _prev_token_at is not None:
+                    stats.record_itl(_now - _prev_token_at)
+                _prev_token_at = _now
+                yield f"event: {Constants.EVENT_CONTENT_BLOCK_DELTA}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_DELTA, 'index': thinking_index, 'delta': {'type': Constants.DELTA_THINKING, 'thinking': reasoning_text}}, ensure_ascii=False)}\n\n"
+            elif reasoning_text and not want_thinking:
+                _now = time.monotonic()
+                if _first_token_at is None:
+                    _first_token_at = _now
+                    stats.record_ttft(_now - _stream_t0, session_key=usage_key)
+                _prev_token_at = _now
 
             # Handle text delta
             if delta and "content" in delta and delta["content"] is not None:
                 _now = time.monotonic()
                 if _first_token_at is None:
                     _first_token_at = _now
-                    stats.record_ttft(_now - _stream_t0)
+                    stats.record_ttft(_now - _stream_t0, session_key=usage_key)
                     logger.debug(
                         "Stream %s TTFT client=%.1fms",
                         request_id,
@@ -378,7 +459,7 @@ async def convert_openai_streaming_to_claude_with_cancellation(
 
                         if _first_token_at is None:
                             _first_token_at = time.monotonic()
-                            stats.record_ttft(_first_token_at - _stream_t0)
+                            stats.record_ttft(_first_token_at - _stream_t0, session_key=usage_key)
                         _prev_token_at = time.monotonic()
 
                         yield f"event: {Constants.EVENT_CONTENT_BLOCK_START}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_START, 'index': claude_index, 'content_block': {'type': Constants.CONTENT_TOOL_USE, 'id': tool_call['id'], 'name': tool_call['name'], 'input': {}}}, ensure_ascii=False)}\n\n"
@@ -453,8 +534,14 @@ async def convert_openai_streaming_to_claude_with_cancellation(
 
     # Send final SSE events
     # Chat streams only count hits in endpoints.py — feed the final usage
-    # into stats here so streamed tokens aren't invisible.
-    stats.add_tokens(usage_data)
+    # into stats here so streamed tokens aren't invisible. Scoped per
+    # conversation so the next turn's message_start base doesn't reset.
+    stats.add_tokens(
+        usage_data,
+        key=usage_key,
+        model=original_request.model,
+        ttl=_effective_ttl(original_request, getattr(_config, "cache_ttl_default", "5m")),
+    )
     # Backstop: flush any tool-args tail that arrived before its block
     # started (or after the last incremental forward).
     for tool_data in current_tool_calls.values():
@@ -462,6 +549,11 @@ async def convert_openai_streaming_to_claude_with_cancellation(
             tail = tool_data.get("args_buffer", "")[tool_data.get("sent_len", 0):]
             if tail:
                 yield f"event: {Constants.EVENT_CONTENT_BLOCK_DELTA}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_DELTA, 'index': tool_data['claude_index'], 'delta': {'type': Constants.DELTA_INPUT_JSON, 'partial_json': tail}}, ensure_ascii=False)}\n\n"
+
+    if thinking_open:
+        yield f"event: {Constants.EVENT_CONTENT_BLOCK_DELTA}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_DELTA, 'index': thinking_index, 'delta': {'type': 'signature_delta', 'signature': ''}}, ensure_ascii=False)}\n\n"
+        yield f"event: {Constants.EVENT_CONTENT_BLOCK_STOP}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_STOP, 'index': thinking_index}, ensure_ascii=False)}\n\n"
+        thinking_open = False
 
     yield f"event: {Constants.EVENT_CONTENT_BLOCK_STOP}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_STOP, 'index': text_block_index}, ensure_ascii=False)}\n\n"
 

@@ -134,6 +134,14 @@ class ProxyStats:
         self.tokens_in = 0
         self.tokens_out = 0
         self.tokens_cached = 0
+        # P4: cache-creation write tokens (5m tier default; 1h split in cost).
+        self.tokens_cache_creation = 0
+        # P5: subset of creation tokens billed at the 1h tier.
+        self.tokens_cache_creation_1h = 0
+        # P1: list-price cost + per-conversation session rollups.
+        self.total_cost_usd = 0.0
+        self.cost_by_model: Dict[str, float] = {}
+        self._sessions: Dict[str, Dict[str, Any]] = {}
         # Last completed response's usage per conversation key (Claude-shape
         # keys); reported in the next message_start so the live counter
         # stays continuous. LRU-capped: concurrent sessions each keep
@@ -153,6 +161,65 @@ class ProxyStats:
         self.itl_samples: deque = deque(maxlen=500)
         self.keepalive_sent = 0
 
+    def _update_session_locked(
+        self,
+        key: str,
+        model: Optional[str],
+        usage: Optional[Dict[str, Any]],
+        ttl: str = "5m",
+    ) -> None:
+        """Add one completed turn to a per-conversation session (lock held)."""
+        if not key or not usage:
+            return
+        u_in = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+        u_out = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+        u_cached = int(
+            usage.get("cache_read_input_tokens", 0)
+            or (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
+            or (usage.get("input_tokens_details") or {}).get("cached_tokens", 0)
+        )
+        u_write = int(usage.get("cache_creation_input_tokens", 0))
+        if u_in == 0 and u_out == 0 and u_cached == 0 and u_write == 0:
+            return
+        try:
+            from src.core.pricing import cost_usd as _cost_usd
+        except Exception:
+            _cost_usd = lambda m, u, **k: 0.0  # noqa: E731
+        cost = _cost_usd(model, usage, ttl=ttl)
+        now = time.time()
+        sess = self._sessions.get(key)
+        if sess is None:
+            if len(self._sessions) >= _MAX_USAGE_KEYS:
+                oldest = next(iter(self._sessions))
+                del self._sessions[oldest]
+            sess = {
+                "tokens_in": 0,
+                "tokens_out": 0,
+                "tokens_cached": 0,
+                "tokens_cache_creation": 0,
+                "tokens_cache_creation_1h": 0,
+                "cost_usd": 0.0,
+                "turns": 0,
+                "models": {},
+                "cache_ttl": ttl,
+                "first_seen": now,
+                "last_seen": now,
+                "ttft_samples": deque(maxlen=100),
+            }
+            self._sessions[key] = sess
+        sess["tokens_in"] += u_in
+        sess["tokens_out"] += u_out
+        sess["tokens_cached"] += u_cached
+        sess["tokens_cache_creation"] += u_write
+        if ttl == "1h":
+            sess["tokens_cache_creation_1h"] += u_write
+            sess["cache_ttl"] = "1h"
+        sess["cost_usd"] += cost
+        sess["turns"] += 1
+        sess["last_seen"] = now
+        if model:
+            sess["models"][model] = sess["models"].get(model, 0) + 1
+
     def record(
         self,
         endpoint: str,
@@ -160,6 +227,8 @@ class ProxyStats:
         status: int = 200,
         latency: Optional[float] = None,
         usage: Optional[Dict[str, Any]] = None,
+        session_key: Optional[str] = None,
+        ttl: str = "5m",
     ):
         """Record one completed request."""
         with self._lock:
@@ -190,6 +259,21 @@ class ProxyStats:
                     or (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
                     or (usage.get("input_tokens_details") or {}).get("cached_tokens", 0)
                 )
+                self.tokens_cache_creation += int(usage.get("cache_creation_input_tokens", 0))
+                if ttl == "1h":
+                    self.tokens_cache_creation_1h = getattr(self, "tokens_cache_creation_1h", 0) + int(
+                        usage.get("cache_creation_input_tokens", 0)
+                    )
+                try:
+                    from src.core.pricing import cost_usd as _cost_usd
+                except Exception:
+                    _cost_usd = lambda m, u, **k: 0.0  # noqa: E731
+                cost = _cost_usd(model, usage, ttl=ttl)
+                self.total_cost_usd += cost
+                if model:
+                    self.cost_by_model[model] = self.cost_by_model.get(model, 0.0) + cost
+                if session_key:
+                    self._update_session_locked(session_key, model, usage, ttl=ttl)
 
     def note_model(self, model: Optional[str]):
         """Count a request against a model name (endpoint counting happens elsewhere)."""
@@ -223,7 +307,9 @@ class ProxyStats:
         with self._lock:
             self.streams += 1
 
-    def record_ttft(self, latency_secs: float) -> None:
+    def record_ttft(
+        self, latency_secs: float, session_key: Optional[str] = None
+    ) -> None:
         """Record time-to-first-token for one stream (seconds)."""
         if not isinstance(latency_secs, (int, float)):
             return
@@ -233,6 +319,11 @@ class ProxyStats:
             self.ttft_sum += latency_secs
             self.ttft_count += 1
             self.ttft_samples.append(latency_secs)
+            if session_key and session_key in self._sessions:
+                try:
+                    self._sessions[session_key]["ttft_samples"].append(latency_secs)
+                except Exception:
+                    pass
 
     def record_itl(self, latency_secs: float) -> None:
         """Record one inter-token gap (seconds)."""
@@ -272,6 +363,18 @@ class ProxyStats:
         """
         if not usage:
             return
+        _in = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+        _cr = int(
+            usage.get("cache_read_input_tokens", 0)
+            or (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
+            or (usage.get("input_tokens_details") or {}).get("cached_tokens", 0)
+        )
+        _cc = int(usage.get("cache_creation_input_tokens", 0))
+        # Don't overwrite a good base with an all-zero usage (upstream
+        # streams without usage chunks). That would collapse the next
+        # turn's live counter back to zero.
+        if _in == 0 and _cr == 0 and _cc == 0:
+            return
         with self._lock:
             if key in self._last_usage:
                 del self._last_usage[key]
@@ -279,22 +382,10 @@ class ProxyStats:
                 oldest = next(iter(self._last_usage))
                 del self._last_usage[oldest]
             self._last_usage[key] = {
-                "input_tokens": int(
-                    usage.get("prompt_tokens") or usage.get("input_tokens") or 0
-                ),
+                "input_tokens": _in,
                 "output_tokens": 0,  # nothing generated yet this turn
-                "cache_read_input_tokens": int(
-                    usage.get("cache_read_input_tokens", 0)
-                    or (usage.get("prompt_tokens_details") or {}).get(
-                        "cached_tokens", 0
-                    )
-                    or (usage.get("input_tokens_details") or {}).get(
-                        "cached_tokens", 0
-                    )
-                ),
-                "cache_creation_input_tokens": int(
-                    usage.get("cache_creation_input_tokens", 0)
-                ),
+                "cache_read_input_tokens": _cr,
+                "cache_creation_input_tokens": _cc,
             }
 
     def last_response_usage(self, key: str = "default") -> Dict[str, int]:
@@ -313,7 +404,11 @@ class ProxyStats:
             )
 
     def add_tokens(
-        self, usage: Optional[Dict[str, Any]], key: str = "default"
+        self,
+        usage: Optional[Dict[str, Any]],
+        key: str = "default",
+        model: Optional[str] = None,
+        ttl: str = "5m",
     ):
         """Add token usage without counting a new request."""
         self.note_response_usage(usage, key=key)
@@ -329,6 +424,86 @@ class ProxyStats:
                 or (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
                 or (usage.get("input_tokens_details") or {}).get("cached_tokens", 0)
             )
+            self.tokens_cache_creation += int(usage.get("cache_creation_input_tokens", 0))
+            if ttl == "1h":
+                self.tokens_cache_creation_1h += int(
+                    usage.get("cache_creation_input_tokens", 0)
+                )
+            try:
+                from src.core.pricing import cost_usd as _cost_usd
+            except Exception:
+                _cost_usd = lambda m, u, **k: 0.0  # noqa: E731
+            cost = _cost_usd(model, usage, ttl=ttl)
+            self.total_cost_usd += cost
+            if model:
+                self.cost_by_model[model] = self.cost_by_model.get(model, 0.0) + cost
+            self._update_session_locked(key, model, usage, ttl=ttl)
+
+    def sessions_snapshot(self) -> List[Dict[str, Any]]:
+        """Per-conversation rollups for GET /api/sessions (JSON-safe)."""
+        with self._lock:
+            out: List[Dict[str, Any]] = []
+            for key, s in self._sessions.items():
+                t_in = s["tokens_in"]
+                ttft_list = sorted(s.get("ttft_samples", []))
+                ttft_p50 = round(_percentile(ttft_list, 0.5) * 1000, 1) if ttft_list else 0.0
+                out.append(
+                    {
+                        "session_id": key,
+                        "turns": s["turns"],
+                        "tokens_in": t_in,
+                        "tokens_out": s["tokens_out"],
+                        "tokens_cached": s["tokens_cached"],
+                        "tokens_cache_creation": s.get("tokens_cache_creation", 0),
+                        "tokens_cache_creation_1h": s.get("tokens_cache_creation_1h", 0),
+                        "cache_hit_pct": round(s["tokens_cached"] / t_in * 100, 1) if t_in else 0.0,
+                        "cost_usd": round(s["cost_usd"], 6),
+                        "ttft_p50_ms": ttft_p50,
+                        "models": dict(s["models"]),
+                        "cache_ttl": s.get("cache_ttl", "5m"),
+                        "first_seen": s["first_seen"],
+                        "last_seen": s["last_seen"],
+                    }
+                )
+            out.sort(key=lambda d: d["last_seen"], reverse=True)
+            return out
+
+    def session_detail(self, key: str) -> Optional[Dict[str, Any]]:
+        """One session with live base + totals, or None."""
+        with self._lock:
+            s = self._sessions.get(key)
+            if not s:
+                return None
+            base = dict(
+                self._last_usage.get(
+                    key,
+                    {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "cache_read_input_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                    },
+                )
+            )
+            t_in = s["tokens_in"]
+            ttft_list = sorted(s.get("ttft_samples", []))
+            return {
+                "session_id": key,
+                "turns": s["turns"],
+                "tokens_in": t_in,
+                "tokens_out": s["tokens_out"],
+                "tokens_cached": s["tokens_cached"],
+                "tokens_cache_creation": s.get("tokens_cache_creation", 0),
+                "tokens_cache_creation_1h": s.get("tokens_cache_creation_1h", 0),
+                "cache_hit_pct": round(s["tokens_cached"] / t_in * 100, 1) if t_in else 0.0,
+                "cost_usd": round(s["cost_usd"], 6),
+                "ttft_p50_ms": round(_percentile(ttft_list, 0.5) * 1000, 1) if ttft_list else 0.0,
+                "models": dict(s["models"]),
+                "cache_ttl": s.get("cache_ttl", "5m"),
+                "live_base": base,
+                "first_seen": s["first_seen"],
+                "last_seen": s["last_seen"],
+            }
 
     def snapshot(self) -> Dict[str, Any]:
         """Return a JSON-serializable copy of all counters."""
@@ -352,6 +527,11 @@ class ProxyStats:
                 "tokens_in": self.tokens_in,
                 "tokens_out": self.tokens_out,
                 "tokens_cached": self.tokens_cached,
+                "tokens_cache_creation": self.tokens_cache_creation,
+                "tokens_cache_creation_1h": getattr(self, "tokens_cache_creation_1h", 0),
+                "total_cost_usd": round(self.total_cost_usd, 6),
+                "cost_by_model": {k: round(v, 6) for k, v in self.cost_by_model.items()},
+                "active_sessions": len(self._sessions),
                 "by_endpoint": dict(self.by_endpoint),
                 "by_model": dict(self.by_model),
                 "by_status": dict(self.by_status),
