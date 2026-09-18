@@ -1,0 +1,51 @@
+#:schema https://developers.openai.com/codex/config-schema.json
+
+# Codex CLI config — Kilo gateway via local mimo2codex proxy.
+# Copy to ~/.codex/config.toml (then fill ~/.mimo2codex/.env from
+# mimo2codex/.env.example, Kilo block). Any Kilo model id works — swap the
+# `model =` line, e.g. "anthropic/claude-sonnet-4.5".
+
+model = "deepseek/deepseek-v4-flash-0731:free"
+model_provider = "kilo-proxy"
+
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+
+# Model metadata catalog so Codex trusts the context window and reasoning
+# levels. Copy catalog.kilo.json next to this config:
+#   cp mimo2codex/catalog.kilo.json ~/.codex/catalog.json
+model_catalog_json = "~/.codex/catalog.json"
+
+[notice]
+hide_full_access_warning = true
+
+[model_providers.kilo-proxy]
+name = "Kilo gateway (via mimo2codex proxy)"
+base_url = "http://127.0.0.1:8788/v1"
+env_key = "OPENAI_API_KEY"
+wire_api = "responses"
+requires_openai_auth = false
+supports_websockets = false
+stream_idle_timeout_ms = 600000
+
+[features]
+terminal_resize_reflow = true
+memories = true
+goals = true
+prevent_idle_sleep = true
+network_proxy = true
+multi_agent = true
+
+[profiles.strict]
+approval_policy = "on-request"
+sandbox_mode = "read-only"
+web_search = "cached"
+
+[profiles.yolo]
+approval_policy = "never"
+sandbox_mode = "workspace-write"
+web_search = "live"
+
+[agents]
+max_threads = 6
+max_depth = 1

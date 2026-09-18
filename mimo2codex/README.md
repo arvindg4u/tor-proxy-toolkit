@@ -65,6 +65,23 @@ curl -s -o /dev/null -w "%{http_code}\n" \
   -d '{"model":"muse-spark-1.3-contributor-free","input":"hi"}'
 ```
 
+## Alternative backend: Kilo AI gateway
+
+Same template, different provider block — Kilo is a unified
+OpenAI-compatible endpoint, so any `provider/model` id works:
+
+```bash
+# 1. enable the Kilo block in ~/.mimo2codex/.env (see .env.example),
+#    fill in your Kilo key (or leave anonymous for free models)
+# 2. start: mimo2codex --model generic   # or: ../tor-proxy-toolkit/mimo2codex-zen start
+# 3. codex config + catalog:
+cp mimo2codex/config.toml.kilo.example ~/.codex/config.toml
+cp mimo2codex/catalog.kilo.json ~/.codex/catalog.json
+```
+
+Verify with `codex debug models`, then run Codex — requests flow
+Codex → `:8788` → Kilo gateway → model.
+
 ## Codex CLI Integration
 
 Add to `~/.codex/config.toml`:
