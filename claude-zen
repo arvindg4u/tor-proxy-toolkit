@@ -11,6 +11,14 @@ PIDFILE="$PID_DIR/claude-proxy.pid"
 LOGFILE="$LOG_DIR/claude-proxy.log"
 
 do_start() {
+    # Start guard: never launch a second instance. A duplicate either
+    # fails to bind (and dies confusingly) or, worse, leaves the client
+    # glued to whichever instance it connected to first.
+    if ([ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null) \
+        || curl -s --max-time 3 http://127.0.0.1:4013/health >/dev/null 2>&1; then
+        echo "[✗] Already running (pid $(cat "$PIDFILE" 2>/dev/null)) or :4013 busy — refusing second instance (use restart)"
+        return 1
+    fi
     cd "$SCRIPT_DIR/claude-code-proxy"
     export OPENAI_API_KEY="$(grep '^OPENAI_API_KEY=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2-)"
     export OPENAI_BASE_URL="$(grep '^OPENAI_BASE_URL=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2-)"
@@ -53,11 +61,33 @@ do_start() {
 }
 
 do_stop() {
+    # Decisive stop. uvicorn's graceful shutdown waits FOREVER for
+    # in-flight streams after SIGTERM, so a TERM-only stop orphans a
+    # draining process that holds dead client streams open eternally
+    # (client sees endless "Thinking...", proxy counter frozen, nothing
+    # in any log). Seen live: a pre-restart worker survived and glued a
+    # session to a dead stream. So: TERM first (healthy streams finish),
+    # then KILL survivors, then verify the port is actually free. A
+    # killed in-flight stream surfaces as a visible, retryable connection
+    # error — never silence.
     if [ -f "$PIDFILE" ]; then
-        kill "$(cat "$PIDFILE")" 2>/dev/null
+        kill "$(cat "$PIDFILE")" 2>/dev/null || true
         rm -f "$PIDFILE"
     fi
     pkill -f "start_proxy.py" 2>/dev/null || true
+    sleep 3
+    pkill -9 -f "start_proxy.py" 2>/dev/null || true
+    sleep 1
+    if curl -s --max-time 3 http://127.0.0.1:4013/health >/dev/null 2>&1; then
+        echo "[!] WARNING: :4013 still serves after stop — stale process?"
+        pgrep -af "start_proxy.py" 2>/dev/null || true
+        return 1
+    fi
+    if pgrep -f "start_proxy.py" >/dev/null 2>&1; then
+        echo "[!] WARNING: start_proxy.py processes still alive:"
+        pgrep -af "start_proxy.py" 2>/dev/null || true
+        return 1
+    fi
     echo "[✓] Claude Zen proxy stopped (:4013)"
 }
 
