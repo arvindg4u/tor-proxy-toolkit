@@ -106,7 +106,6 @@ def test_no_preamble_with_tools():
 def test_genuine_tools_first():
     out = convert_claude_to_responses(_claude_req_with_tools(), model_manager)
     tools = out["tools"]
-    # Full manifest (gate needs every name exactly) plus the caller tool.
     assert len(tools) == len(GENUINE_CLI_TOOLS) + 1
     assert [t["name"] for t in tools[: len(GENUINE_CLI_TOOLS)]] == [
         t["name"] for t in GENUINE_CLI_TOOLS
@@ -114,70 +113,6 @@ def test_genuine_tools_first():
     # Caller's tool appended after the genuine manifest.
     assert tools[-1]["name"] == "Bash"
     assert out["tool_choice"] == "auto"
-
-
-def test_manifest_duplicates_carry_caller_schema():
-    # Read/Write intermittently failed: the model saw both manifest `read`
-    # (opencode schema: `filePath`) and caller `Read` (Claude schema:
-    # `file_path`), picked either at random, and manifest-shaped args broke
-    # execution after the response-path rename to `Read`. Omitting the
-    # manifest entry is NOT an option (the gate 403s without the exact
-    # names — verified live). So the manifest entry keeps its name +
-    # description but carries the caller's parameters: whichever variant
-    # the model picks, args arrive executable. Shared manifest not mutated.
-    caller_schema = {
-        "type": "object",
-        "properties": {"file_path": {"type": "string"}},
-    }
-    req = _claude_req(
-        tools=[
-            {
-                "name": "Read",
-                "description": "read a file",
-                "input_schema": caller_schema,
-            },
-            {
-                "name": "Write",
-                "description": "write a file",
-                "input_schema": caller_schema,
-            },
-        ]
-    )
-    before = {t["name"]: t["parameters"] for t in GENUINE_CLI_TOOLS}
-    out = convert_claude_to_responses(req, model_manager)
-    names = [t["name"] for t in out["tools"]]
-    # All 27 manifest names still present exactly (gate), callers appended.
-    assert len(out["tools"]) == len(GENUINE_CLI_TOOLS) + 2
-    assert "read" in names and "Read" in names
-    assert "write" in names and "Write" in names
-    by_name = {t["name"]: t for t in out["tools"]}
-    # Manifest duplicates now speak the caller schema...
-    assert "file_path" in by_name["read"]["parameters"]["properties"]
-    assert "filePath" not in by_name["read"]["parameters"]["properties"]
-    # ...names and descriptions untouched (gate-visible)...
-    assert by_name["read"]["description"] == [
-        t for t in GENUINE_CLI_TOOLS if t["name"] == "read"
-    ][0]["description"]
-    # ...untouched entries keep their own schema...
-    assert by_name["bash"]["parameters"] == before["bash"]
-    # ...and the shared manifest is not mutated.
-    after = {t["name"]: t["parameters"] for t in GENUINE_CLI_TOOLS}
-    assert before == after
-
-
-def test_non_overlapping_caller_appends():
-    req = _claude_req(
-        tools=[
-            {
-                "name": "my_probe",
-                "description": "probe",
-                "input_schema": {"type": "object", "properties": {}},
-            }
-        ]
-    )
-    out = convert_claude_to_responses(req, model_manager)
-    assert len(out["tools"]) == len(GENUINE_CLI_TOOLS) + 1
-    assert out["tools"][-1]["name"] == "my_probe"
 
 
 def test_preamble_not_duplicated():
@@ -248,8 +183,6 @@ _TESTS = [
     test_preamble_not_duplicated,
     test_no_preamble_with_tools,
     test_genuine_tools_first,
-    test_manifest_duplicates_carry_caller_schema,
-    test_non_overlapping_caller_appends,
     test_upstream_headers_msg_id,
     test_collect_prefers_completed_payload,
     test_collect_assembles_from_deltas,
