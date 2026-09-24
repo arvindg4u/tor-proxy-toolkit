@@ -29,6 +29,27 @@ _INVALID_CHARS = re.compile(r"[^a-zA-Z0-9_-]")
 _registry: dict = {}
 _lock = threading.Lock()
 
+# Canonical Claude-side names for the lowercase builtins in the genuine
+# OpenCode CLI manifest (src/core/cli_identity.py GENUINE_CLI_TOOLS).
+# The free-tier gate requires that manifest upstream, but when the model
+# echoes a manifest name (e.g. `grep`) in a function_call instead of the
+# caller's PascalCase tool (e.g. `Grep`), Claude Code rejects it with
+# "No such tool available". Normalize on the response path only; the
+# request path keeps passing names through untouched.
+_CANONICAL_NAMES = {
+    "bash": "Bash",
+    "read": "Read",
+    "edit": "Edit",
+    "write": "Write",
+    "glob": "Glob",
+    "grep": "Grep",
+    "todowrite": "TodoWrite",
+    "task": "Task",
+    "skill": "Skill",
+    "webfetch": "WebFetch",
+    "websearch": "WebSearch",
+}
+
 
 def to_upstream_name(name: str) -> str:
     """Return an upstream-safe alias for a Claude-side tool name.
@@ -64,11 +85,18 @@ def to_upstream_name(name: str) -> str:
 
 
 def from_upstream_name(name: str) -> str:
-    """Map an upstream alias back to the original Claude-side tool name."""
+    """Map an upstream alias back to the original Claude-side tool name.
+
+    Falls back to the canonical-name map: a lowercase manifest builtin
+    echoed by the model (e.g. `grep`) becomes its Claude-side form
+    (e.g. `Grep`). Unknown names pass through untouched.
+    """
     if not name:
         return name
     with _lock:
-        return _registry.get(name, name)
+        if name in _registry:
+            return _registry[name]
+    return _CANONICAL_NAMES.get(name, name)
 
 
 def registered_aliases() -> dict:

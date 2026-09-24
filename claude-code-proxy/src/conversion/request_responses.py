@@ -97,7 +97,36 @@ def convert_claude_to_responses(
                     }
                 )
     if responses_tools:
-        responses_request["tools"] = [*GENUINE_CLI_TOOLS, *responses_tools]
+        # Schema-align, never omit: the gate requires the manifest names
+        # EXACTLY (omitting even one genuine builtin 403s — verified live),
+        # but the model sees two same-capability tools with DIFFERENT
+        # schemas (opencode `read` takes `filePath`, Claude `Read` takes
+        # `file_path`) and picks either at random. A manifest pick comes
+        # back with manifest-shaped args, the response path renames it to
+        # the caller tool, and execution fails on the wrong params — the
+        # intermittent Read/Write failure (sometimes `Read` works,
+        # sometimes `read` breaks).
+        # Fix: where the caller covers a manifest builtin
+        # (case-insensitive), the manifest entry keeps its name +
+        # description (gate-visible) but carries the CALLER's parameters,
+        # so whichever variant the model picks, the args arrive in the
+        # schema the client executes. The gate demonstrably ignores
+        # parameter schemas (caller tools inject arbitrary ones on every
+        # passing turn). Never mutates the shared manifest (copies).
+        caller_schemas = {}
+        for t in responses_tools:
+            tname = (t.get("name") or "").lower()
+            if tname and tname not in caller_schemas:
+                caller_schemas[tname] = t.get("parameters") or {}
+        gate_tools = []
+        for g in GENUINE_CLI_TOOLS:
+            if g.get("name", "").lower() in caller_schemas:
+                g = {
+                    **g,
+                    "parameters": caller_schemas[g["name"].lower()],
+                }
+            gate_tools.append(g)
+        responses_request["tools"] = [*gate_tools, *responses_tools]
     else:
         # Tool-less turn: STILL declare the full genuine CLI manifest.
         # The free-tier gate (tightened ~2026-09-19) requires the tools
