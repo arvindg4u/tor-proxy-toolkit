@@ -53,7 +53,7 @@ class Config:
 
         # Upstream User-Agent. ZEN rate-limits by UA: only opencode client UAs
         # get the normal free tier, everything else is treated as bot traffic.
-        self.upstream_user_agent = os.environ.get("UPSTREAM_USER_AGENT", "opencode/1.18.31")
+        self.upstream_user_agent = os.environ.get("UPSTREAM_USER_AGENT", "opencode/1.18.32")
 
         # OpenCode client identity headers. ZEN's free tier rejects requests
         # without x-opencode-session ("MissingSessionID: free tier can only

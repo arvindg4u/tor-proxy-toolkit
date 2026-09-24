@@ -1,4 +1,4 @@
-"""Free-tier CLI-identity gate tests: developer preamble, msg ids, de-stream.
+"""Free-tier CLI-identity gate tests: genuine tool manifest, msg ids, de-stream.
 
 Runs under pytest when available, and also as a plain script:
     python3 tests/test_cli_identity_gate.py
@@ -22,7 +22,6 @@ from src.conversion.response_responses import (  # noqa: E402
     convert_responses_to_claude_response,
 )
 from src.core.cli_identity import (  # noqa: E402
-    CLI_DEVELOPER_PREAMBLE,
     GENUINE_CLI_TOOLS,
     new_message_id,
     prepend_cli_preamble,
@@ -68,14 +67,19 @@ def _claude_req(**kw):
     return ClaudeMessagesRequest(**base)
 
 
-def test_preamble_prepended():
+def test_toolless_turn_declares_genuine_tools():
+    # Tightened gate (~2026-09-19): a turn with no tools at all gets
+    # FreeTierError, so tool-less client turns still declare the full
+    # genuine CLI manifest upstream (and carry NO title preamble, which
+    # would hijack non-title prompts such as hook evaluation).
     out = convert_claude_to_responses(_claude_req(), model_manager)
-    assert out["input"][0]["role"] == "developer"
-    assert out["input"][0]["content"] == CLI_DEVELOPER_PREAMBLE
-    assert len(CLI_DEVELOPER_PREAMBLE) > 1000
-    # Original user message preserved after the preamble.
-    assert out["input"][1]["role"] == "user"
-    assert "tools" not in out
+    assert all(item.get("role") != "developer" for item in out["input"])
+    assert out["input"][0]["role"] == "user"
+    assert [t["name"] for t in out["tools"]] == [
+        t["name"] for t in GENUINE_CLI_TOOLS
+    ]
+    assert "bash" in [t["name"] for t in out["tools"]]
+    assert "read" in [t["name"] for t in out["tools"]]
 
 
 def _claude_req_with_tools():
@@ -175,7 +179,7 @@ def test_collect_assembles_from_deltas():
 
 
 _TESTS = [
-    test_preamble_prepended,
+    test_toolless_turn_declares_genuine_tools,
     test_preamble_not_duplicated,
     test_no_preamble_with_tools,
     test_genuine_tools_first,

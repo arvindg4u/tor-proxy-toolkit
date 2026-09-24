@@ -1,27 +1,38 @@
 """Genuine OpenCode CLI identity artifacts for the ZEN free tier.
 
-Background (reverse-engineered 2026-09-18): OpenCode's free tier is now
-restricted to traffic that is verifiably from the OpenCode CLI. The gateway
-("Console") rejects anything else with::
+Background (reverse-engineered 2026-09-18, gate tightened ~2026-09-19):
+OpenCode's free tier is restricted to traffic that is verifiably from the
+OpenCode CLI. The gateway ("Console") rejects anything else with::
 
     FreeTierError: OpenCode's free tier can only be used from within OpenCode
 
-Experiments against the live CLI (v1.18.31) showed the gate requires, on
-every Responses request:
+The gate requires, on every Responses request:
 
 1. stream: true in the request body (non-streaming bodies are rejected
    even when everything else matches),
-2. an input[0] developer message carrying genuine CLI prompt text
-   (CLI_SYSTEM_PREAMBLE below, captured verbatim from real CLI traffic),
+2. a tools array declaring the genuine CLI tool functions — including
+   shell/bash AND read. A turn with NO tools at all is rejected even
+   with everything else matching (this broke Claude Code stop-hook
+   evaluation, which sends tool-less requests). Foreign or partial tool
+   sets are likewise rejected: only the full genuine 27-tool CLI
+   manifest (GENUINE_CLI_TOOLS below, captured verbatim) passes, with
+   the caller's own tools appended after it,
 3. an x-opencode-session header holding a genuine CLI-generated
-   session id (ses_ + 26 chars; values are reusable and do not expire
-   -- set one via the OPENCODE_SESSION_ID env var),
-4. Authorization: Bearer public (the CLI's no-key free-tier credential),
-5. User-Agent: opencode/<cli-version>.
+   session id matching ``^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$`` (values are
+   reusable and do not expire -- set one via OPENCODE_SESSION_ID),
+4. User-Agent: opencode/<cli-version> (>= 1.17.0),
+5. x-opencode-client: cli, plus a msg_-formatted x-opencode-request id.
 
-Notably NOT required: a logged-in account, fresh/unique ids, the
-x-opencode-request value (any msg_-formatted id works), or tunneling
-(the same 403 reproduces on a direct connection).
+Notably NOT required: a logged-in account, fresh/unique ids, or
+tunneling (the same 403 reproduces on a direct connection).
+
+CLI_DEVELOPER_PREAMBLE (retired from the request path): the verbatim
+title-generation prompt captured from genuine CLI traffic. Pre-Sep-19
+it satisfied the gate on tool-less turns; the tightened gate rejects
+preamble-without-tools, and the text itself ("output ONLY a thread
+title ... Never use tools") hijacks any non-title prompt it prefixes,
+so the converter no longer sends it. Kept here (with its unit tests)
+as documented history.
 """
 
 import secrets

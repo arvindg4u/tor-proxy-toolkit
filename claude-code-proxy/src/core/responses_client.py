@@ -111,7 +111,7 @@ class ResponsesClient:
         self.headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
-            "User-Agent": user_agent or "opencode/1.18.18",
+            "User-Agent": user_agent or "opencode/1.18.32",
         }
         if custom_headers:
             self.headers.update(custom_headers)
@@ -126,12 +126,35 @@ class ResponsesClient:
         return {**self.headers, **config.get_upstream_headers()}
 
     @staticmethod
+    def _payload_shape(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """Content-free shape summary of an upstream payload (gate debugging).
+
+        Records only counts/flags — never prompt text — so a rejection can
+        be matched to its request shape (e.g. tool-less vs tool-carrying).
+        """
+        if not isinstance(payload, dict):
+            return {}
+        tools = payload.get("tools") or []
+        items = payload.get("input") or []
+        return {
+            "stream": payload.get("stream"),
+            "ntools": len(tools),
+            "tool_names": [t.get("name") for t in tools[:32]
+                           if isinstance(t, dict)][:32],
+            "has_instructions": bool(payload.get("instructions")),
+            "input_roles": [i.get("role") for i in items[:8]
+                            if isinstance(i, dict)],
+            "has_reasoning": bool(payload.get("reasoning")),
+        }
+
+    @staticmethod
     def _dump_failure(
         status: int,
         error: str,
         model: Optional[str] = None,
         request_id: Optional[str] = None,
         ttl: Optional[str] = None,
+        payload: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Save a compact failure record locally for diagnosis.
 
@@ -154,6 +177,7 @@ class ResponsesClient:
                         "model": model,
                         "request_id": request_id,
                         "cache_ttl": ttl,
+                        "shape": ResponsesClient._payload_shape(payload),
                         "at": _time.time(),
                     },
                     f,
@@ -204,6 +228,7 @@ class ResponsesClient:
                             err_text,
                             model=payload.get("model"),
                             request_id=request_id,
+                            payload=payload,
                         )
                         raise HTTPException(
                             status_code=resp.status_code,
@@ -236,11 +261,13 @@ class ResponsesClient:
                     # (e.g. FreeUsageLimitError): signal it like an HTTP 429
                     # so the failure watcher rotates the egress peer.
                     self._dump_failure(
-                        429, err_text, model=payload.get("model"), request_id=request_id
+                        429, err_text, model=payload.get("model"), request_id=request_id,
+                        payload=payload,
                     )
                     raise HTTPException(status_code=429, detail=detail)
                 self._dump_failure(
-                    500, err_text, model=payload.get("model"), request_id=request_id
+                    500, err_text, model=payload.get("model"), request_id=request_id,
+                    payload=payload,
                 )
                 raise HTTPException(
                     status_code=500,
@@ -298,6 +325,7 @@ class ResponsesClient:
                                     err_text,
                                     model=body.get("model"),
                                     request_id=request_id,
+                                    payload=body,
                                 )
                                 raise HTTPException(
                                     status_code=resp.status_code,

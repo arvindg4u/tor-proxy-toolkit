@@ -12,7 +12,7 @@ from typing import Any, Dict, List
 
 from src.core.constants import Constants
 from src.core.config import config
-from src.core.cli_identity import GENUINE_CLI_TOOLS, prepend_cli_preamble
+from src.core.cli_identity import GENUINE_CLI_TOOLS
 from src.conversion.tool_names import to_upstream_name
 from src.models.claude import ClaudeMessagesRequest, ClaudeMessage
 
@@ -34,9 +34,9 @@ def convert_claude_to_responses(
     if instructions:
         responses_request["instructions"] = instructions
 
-    # Messages -> input items. Whether the genuine CLI developer preamble is
-    # prepended depends on tools (see below): title-dev + tools is an
-    # incoherent combo the gate rejects, so the two shapes are exclusive.
+    # Messages -> input items (no developer preamble: the gate no longer
+    # accepts preamble-without-tools, and title text hijacks non-title
+    # prompts — every turn instead declares the genuine tool manifest).
     responses_request["input"] = _convert_messages(claude_request.messages)
 
     # Token budget: clamp like the chat path, then apply the responses floor
@@ -71,11 +71,12 @@ def convert_claude_to_responses(
     # Tools: flatten to function tools (ZEN/Muse Spark rejects
     # custom/namespace tool types — same fix as mimo2codex).
     #
-    # Free-tier gate, tool-carrying turns (verified 2026-09-18): foreign or
-    # partial tool sets get FreeTierError; only the full genuine 27-tool CLI
-    # manifest (with the caller's tools appended) passes -- and only WITHOUT
-    # the developer preamble (title-dev + tools is an incoherent combo the
-    # gate also rejects). See src/core/cli_identity.py.
+    # Free-tier gate (verified 2026-09-18, tightened ~2026-09-19): foreign
+    # or partial tool sets get FreeTierError; only the full genuine 27-tool
+    # CLI manifest (with the caller's tools appended) passes — and it must
+    # be present on EVERY turn, including tool-less ones (no-tools-at-all
+    # now 403s even with stream:true + genuine session + CLI UA; this is
+    # what broke Claude Code stop-hook evaluation). See cli_identity.py.
     responses_tools = []
     if claude_request.tools:
         for tool in claude_request.tools:
@@ -98,10 +99,17 @@ def convert_claude_to_responses(
     if responses_tools:
         responses_request["tools"] = [*GENUINE_CLI_TOOLS, *responses_tools]
     else:
-        # Tool-less turn: title-shape with the genuine CLI developer preamble.
-        responses_request["input"] = prepend_cli_preamble(
-            responses_request["input"]
-        )
+        # Tool-less turn: STILL declare the full genuine CLI manifest.
+        # The free-tier gate (tightened ~2026-09-19) requires the tools
+        # array to declare shell/bash + read on EVERY turn; a turn with no
+        # tools at all gets FreeTierError even with stream:true, a genuine
+        # session id and CLI UA (this broke Claude Code stop-hook
+        # evaluation, which sends tool-less requests). The model simply
+        # answers in text when the prompt doesn't invite tool use.
+        # Deliberately NO title-dev preamble here: that text ("output ONLY
+        # a thread title ... Never use tools") hijacks any non-title
+        # prompt it is prepended to (e.g. hook evaluation).
+        responses_request["tools"] = list(GENUINE_CLI_TOOLS)
 
     # Tool choice
     # Tool choice: this upstream accepts ONLY "auto" — "none",
