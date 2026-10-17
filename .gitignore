@@ -13,6 +13,8 @@ venv/
 
 # Logs
 *.log
+logs.txt
+logs.txt
 /var/log/
 # Proxy runtime failure dumps (may echo upstream error text)
 claude-code-proxy/logs/

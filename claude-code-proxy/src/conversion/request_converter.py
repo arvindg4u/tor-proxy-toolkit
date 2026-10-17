@@ -1,13 +1,22 @@
 import json
 from typing import Dict, Any, List
 from venv import logger
+import logging
+
 from src.core.constants import Constants
 from src.models.claude import ClaudeMessagesRequest, ClaudeMessage
 from src.conversion.tool_names import to_upstream_name
+from src.core.cli_identity import chat_format_gate_tools
 from src.core.config import config
-import logging
 
 logger = logging.getLogger(__name__)
+
+
+def _gate_enabled() -> bool:
+    """True when the upstream is OpenCode: its free tier rejects chat turns
+    that don't declare the genuine CLI tool manifest (FreeTierError)."""
+    base = (config.openai_base_url or "").lower()
+    return "opencode.ai" in base
 
 
 def convert_claude_to_openai(
@@ -122,8 +131,8 @@ def convert_claude_to_openai(
         openai_request["extra_body"] = {"thinking": {"type": "enabled"}}
 
     # Convert tools
+    openai_tools: List[Dict[str, Any]] = []
     if claude_request.tools:
-        openai_tools = []
         for tool in claude_request.tools:
             if tool.name and tool.name.strip():
                 openai_tools.append(
@@ -138,8 +147,17 @@ def convert_claude_to_openai(
                         },
                     }
                 )
-        if openai_tools:
-            openai_request["tools"] = openai_tools
+    if openai_tools or _gate_enabled():
+        # Free-tier gate (OpenCode free models): EVERY /chat/completions
+        # request must declare the genuine CLI tool manifest — tool-less
+        # turns and foreign/partial tool sets are rejected with
+        # FreeTierError. Caller tools are appended after the manifest
+        # (see cli_identity.py: chat_format_gate_tools). Tool-less turns
+        # get the full manifest alone; the model answers in text when the
+        # prompt doesn't invite tool use.
+        openai_request["tools"] = chat_format_gate_tools(
+            openai_tools, enabled=_gate_enabled()
+        )
 
     # Convert tool choice
     if claude_request.tool_choice:

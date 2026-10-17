@@ -1,7 +1,10 @@
+import logging
 import os
 import sys
 
 from src.core.cli_identity import new_message_id
+
+logger = logging.getLogger(__name__)
 
 
 def _new_session_id():
@@ -53,7 +56,10 @@ class Config:
 
         # Upstream User-Agent. ZEN rate-limits by UA: only opencode client UAs
         # get the normal free tier, everything else is treated as bot traffic.
-        self.upstream_user_agent = os.environ.get("UPSTREAM_USER_AGENT", "opencode/1.18.32")
+        # The gate also enforces CLI *freshness* (a stale pinned version gets
+        # 403 FreeTierError), so resolve the current opencode release from the
+        # npm registry with a daily cache. UPSTREAM_USER_AGENT still overrides.
+        self.upstream_user_agent = os.environ.get("UPSTREAM_USER_AGENT", "").strip() or self._fresh_opencode_ua()
 
         # OpenCode client identity headers. ZEN's free tier rejects requests
         # without x-opencode-session ("MissingSessionID: free tier can only
@@ -94,6 +100,55 @@ class Config:
         if self.cache_ttl_default not in ("5m", "1h"):
             print(f"Warning: unknown CACHE_TTL_DEFAULT '{self.cache_ttl_default}', falling back to '5m'.")
             self.cache_ttl_default = "5m"
+
+    def _fresh_opencode_ua(self, pinned: str = "opencode/1.19.3", ttl_secs: int = 86400) -> str:
+        """Latest ``opencode/<version>`` UA, cached ~daily, falls back to pinned.
+
+        ``User-Agent: opencode/<version>`` is one of the free-tier gate checks;
+        a stale version starts 403ing once the CLI moves on. Querying npm keeps
+        the pin current without manual updates. Never raises: any failure
+        (offline, timeout, parse) falls back to the last cached value, then the
+        pinned default.
+        """
+        import json as _json
+        from pathlib import Path
+
+        cache = Path.home() / ".cache" / "opencode-ua" / "version.txt"
+        try:
+            import time as _time
+            if cache.exists() and (_time.time() - cache.stat().st_mtime) < ttl_secs:
+                cached = cache.read_text().strip()
+                if cached:
+                    return cached
+        except OSError:
+            pass
+        try:
+            import httpx
+            r = httpx.get(
+                "https://registry.npmjs.org/opencode-ai/latest",
+                timeout=3.0,
+                headers={"User-Agent": "claude-code-proxy/version-probe"},
+            )
+            ver = str(_json.loads(r.text)["version"]).strip()
+            if ver:
+                ua = f"opencode/{ver}"
+                try:
+                    cache.parent.mkdir(parents=True, exist_ok=True)
+                    cache.write_text(ua)
+                except OSError:
+                    pass
+                return ua
+        except Exception as e:
+            logger.debug(f"opencode version probe failed: {e}")
+        # Serve stale cache if fresh fetch failed but an old one exists.
+        try:
+            cached = cache.read_text().strip()
+            if cached:
+                return cached
+        except OSError:
+            pass
+        return pinned
+
         
     def validate_api_key(self):
         """Basic API key validation"""

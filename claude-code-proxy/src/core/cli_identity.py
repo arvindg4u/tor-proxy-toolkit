@@ -65,3 +65,73 @@ def prepend_cli_preamble(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if items and items[0].get("role") == "developer":
         return items
     return [{"role": "developer", "content": CLI_DEVELOPER_PREAMBLE}] + list(items)
+
+
+# ---------------------------------------------------------------------------
+# /chat/completions free-tier gate tools.
+#
+# The reverse-engineered gate checks (see module docstring) apply to chat
+# completions requests exactly as to Responses requests: tool-less turns and
+# foreign/partial tool sets are rejected with FreeTierError, so EVERY chat
+# request must declare the genuine CLI manifest, with the caller's own tools
+# appended after it (mirror of the Responses-path logic in
+# conversion/request_responses.py).
+#
+# Manifest entries are in Responses tool format ({type, name, description,
+# parameters, strict}); the chat wire format nests the function payload:
+#     {"type": "function", "function": {name, description, parameters, strict}}
+# ---------------------------------------------------------------------------
+
+_chat_manifest_cache: Optional[List[Dict[str, Any]]] = None
+
+
+def _chat_cli_manifest() -> List[Dict[str, Any]]:
+    """Convert GENUINE_CLI_TOOLS to OpenAI chat-completions tool format (cached)."""
+    global _chat_manifest_cache
+    if _chat_manifest_cache is None:
+        converted: List[Dict[str, Any]] = []
+        for g in GENUINE_CLI_TOOLS:
+            converted.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": g.get("name", ""),
+                        "description": g.get("description", ""),
+                        "parameters": g.get("parameters") or {},
+                        "strict": bool(g.get("strict", False)),
+                    },
+                }
+            )
+        _chat_manifest_cache = converted
+    return _chat_manifest_cache
+
+
+def chat_format_gate_tools(caller_tools, enabled: bool = True) -> List[Dict[str, Any]]:
+    """Merge the gate-required CLI manifest into an OpenAI chat tools array.
+
+    ``caller_tools`` must already be chat format ({"type": "function",
+    "function": {...}}). Same-name (case-insensitive) caller parameters
+    override the manifest entry's parameters: the gate ignores parameter
+    schemas but the caller's tool must execute the arguments the model
+    emits. The manifest entry keeps its name + description (gate-visible).
+    Tool-less turns get the full manifest alone. Never mutates inputs.
+
+    ``enabled=False`` (non-OpenCode upstream) passes caller tools through
+    unchanged.
+    """
+    caller = list(caller_tools or [])
+    if not enabled:
+        return caller
+    caller_schemas: Dict[str, Any] = {}
+    for t in caller:
+        fn = t.get("function") or {}
+        tname = (fn.get("name") or "").lower()
+        if tname and tname not in caller_schemas:
+            caller_schemas[tname] = fn.get("parameters") or {}
+    gate_tools: List[Dict[str, Any]] = []
+    for g in _chat_cli_manifest():
+        tname = (g["function"].get("name") or "").lower()
+        if tname in caller_schemas:
+            g = {**g, "function": {**g["function"], "parameters": caller_schemas[tname]}}
+        gate_tools.append(g)
+    return [*gate_tools, *caller]

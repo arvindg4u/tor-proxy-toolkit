@@ -1,9 +1,10 @@
 #!/bin/bash
-# Single zen instance on :4013. ALL upstream traffic (opencode.ai:443) goes
-# via the WG tunnel (stable 127.0.0.1:18104), scoped to this process only —
-# nothing global, no system exports.
-# Fail-closed: refuses to start when the tunnel is down, so traffic can never
-# silently leak direct.
+# Single zen instance on :4013. Upstream traffic (opencode.ai:443) goes
+# via the WG tunnel (stable 127.0.0.1:18104) when that component is
+# installed, scoped to this process only — nothing global, no system
+# exports. Fail-closed where the tunnel component exists: refuses to start
+# when the tunnel is down, so traffic can never silently leak direct.
+# Managed target: claude-code-proxy only.
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 PID_DIR="/tmp/tor-toolkit-pids"
 LOG_DIR="${HOME}/.claude/zen-logs"
@@ -34,25 +35,34 @@ do_start() {
     if [ -d "$SCRIPT_DIR/.libs" ]; then
         export PYTHONPATH="$SCRIPT_DIR/.libs${PYTHONPATH:+:$PYTHONPATH}"
     fi
-    # Tunnel upstream (process-scoped). httpx honors proxy env; NO_PROXY in
-    # ~/.claude/settings.json covers only localhost, so zen->127.0.0.1 stays
-    # direct while zen->opencode.ai goes via the tunnel.
+    # Upstream transport (process-scoped). Fail-closed where the WG tunnel
+    # component is INSTALLED: refuses direct upstream so nothing leaks.
+    # When the component isn't installed on this machine, run direct.
     _wg_state="$SCRIPT_DIR/../wgtunnel/wireproxy"
-    _wg_port="$(cat "$_wg_state/stable.port" 2>/dev/null || echo 18104)"
-    if [ ! -f "$_wg_state/active.pid" ] \
-       || ! kill -0 "$(cat "$_wg_state/active.pid")" 2>/dev/null; then
-        echo "[✗] Tunnel is DOWN — start it first: wg-user restart"
-        echo "    (fail-closed: refusing direct upstream so nothing leaks)"
-        return 1
+    if [ -d "$_wg_state" ]; then
+        _wg_port="$(cat "$_wg_state/stable.port" 2>/dev/null || echo 18104)"
+        if [ ! -f "$_wg_state/active.pid" ] \
+           || ! kill -0 "$(cat "$_wg_state/active.pid")" 2>/dev/null; then
+            echo "[✗] Tunnel is DOWN — start it first: wg-user restart"
+            echo "    (fail-closed: refusing direct upstream so nothing leaks)"
+            return 1
+        fi
+        export HTTP_PROXY="http://127.0.0.1:$_wg_port" HTTPS_PROXY="http://127.0.0.1:$_wg_port"
+        export http_proxy="$HTTP_PROXY" https_proxy="$HTTPS_PROXY"
+        _transport="via tunnel 127.0.0.1:$_wg_port"
+    else
+        echo "[i] No wgtunnel component installed — upstream goes direct"
+        _transport="direct"
     fi
-    export HTTP_PROXY="http://127.0.0.1:$_wg_port" HTTPS_PROXY="http://127.0.0.1:$_wg_port"
-    export http_proxy="$HTTP_PROXY" https_proxy="$HTTPS_PROXY"
     mkdir -p "$LOG_DIR" "$PID_DIR"
-    python3 start_proxy.py > "$LOGFILE" 2>&1 &
+    # Prefer the proxy's venv when present; fall back to PATH python3.
+    _py="python3"
+    [ -x "$SCRIPT_DIR/claude-code-proxy/.venv/bin/python" ] && _py="$SCRIPT_DIR/claude-code-proxy/.venv/bin/python"
+    "$_py" start_proxy.py > "$LOGFILE" 2>&1 &
     echo $! > "$PIDFILE"
     sleep 2
     if kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-        echo "[✓] Claude Zen proxy started (PID: $(cat "$PIDFILE")) via tunnel 127.0.0.1:$_wg_port"
+        echo "[✓] Claude Zen proxy started (PID: $(cat "$PIDFILE")) $_transport"
         return 0
     fi
     echo "[✗] Failed to start — check $LOGFILE"
@@ -93,6 +103,7 @@ do_stop() {
 
 tunnel_up() {
     _s="$SCRIPT_DIR/../wgtunnel/wireproxy"
+    [ -d "$_s" ] || return 0   # component not installed: no gate
     [ -f "$_s/active.pid" ] && kill -0 "$(cat "$_s/active.pid")" 2>/dev/null
 }
 
@@ -124,6 +135,6 @@ case "${1:-status}" in
         ;;
     *)
         echo "Usage: claude-zen {start|stop|restart|status}"
-        echo "  :4013, upstream via WG tunnel (stable 127.0.0.1:18104), fail-closed"
+        echo "  :4013 — upstream direct, or via WG tunnel when installed (fail-closed)"
         ;;
 esac

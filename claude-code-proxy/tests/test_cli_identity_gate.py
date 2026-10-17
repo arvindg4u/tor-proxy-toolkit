@@ -191,7 +191,10 @@ def test_upstream_headers_msg_id():
     h2 = config.get_upstream_headers()
     for h in (h1, h2):
         assert re.fullmatch(r"msg_[A-Za-z0-9]{26}", h["x-opencode-request"]), h
-        assert h["User-Agent"].startswith("opencode/1.18.")
+        # Version must be current-ish (the gate enforces CLI freshness):
+        # any opencode/semver UA is acceptable here; the exact min version
+        # moves with each release, so assert the format, not the pin.
+        assert re.fullmatch(r"opencode/\d+\.\d+\.\d+", h["User-Agent"]), h
     # Fresh id minted on every call.
     assert h1["x-opencode-request"] != h2["x-opencode-request"]
     assert re.fullmatch(r"msg_[A-Za-z0-9]{26}", new_message_id())

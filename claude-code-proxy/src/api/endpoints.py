@@ -138,10 +138,18 @@ async def create_message(request: ClaudeMessagesRequest, http_request: Request, 
                 },
             )
         else:
-            # Non-streaming response
-            openai_response = await openai_client.create_chat_completion(
-                openai_request, request_id
-            )
+            # Non-streaming response. OpenCode's free tier rejects
+            # stream:false upstream (same as the Responses path), so on the
+            # gate path we stream upstream and assemble the ChatCompletion
+            # before converting.
+            if "opencode.ai" in (config.openai_base_url or "").lower():
+                openai_response = await _collect_streamed_chat_response(
+                    openai_client, openai_request, request_id, http_request
+                )
+            else:
+                openai_response = await openai_client.create_chat_completion(
+                    openai_request, request_id
+                )
             claude_response = convert_openai_to_claude_response(
                 openai_response, request
             )
@@ -336,6 +344,102 @@ async def _collect_streamed_response(
         "output": output,
         "usage": usage,
         "status": status,
+    }
+
+
+async def _collect_streamed_chat_response(
+    openai_client, payload: dict, request_id: str, http_request: Request
+) -> dict:
+    """Stream a chat-completions request upstream and assemble one ChatCompletion dict.
+
+    Used for non-streaming clients on OpenCode's free tier: the gate rejects
+    ``stream:false`` upstream, so we always stream and assemble the result
+    here (mirror of _collect_streamed_response for the chat wire API).
+    """
+    from src.conversion.response_converter import _parse_chat_item
+
+    content_parts: list = []
+    reasoning_parts: list = []
+    tool_calls: dict = {}  # index -> accumulating entry
+    usage: dict = {}
+    response_id: str | None = None
+    model: str | None = None
+    finish_reason = None
+    gen = openai_client.create_chat_completion_stream(payload, request_id)
+    try:
+        async for raw_item in gen:
+            if await http_request.is_disconnected():
+                openai_client.cancel_request(request_id)
+                raise HTTPException(status_code=499, detail="Client disconnected")
+            kind, chunk = _parse_chat_item(raw_item)
+            if kind == "done":
+                break
+            if kind != "chunk" or not chunk:
+                continue
+            if chunk.get("id"):
+                response_id = chunk["id"]
+            if chunk.get("model"):
+                model = chunk["model"]
+            if chunk.get("usage"):
+                usage = chunk["usage"]
+            for choice in chunk.get("choices", []) or []:
+                if choice.get("finish_reason"):
+                    finish_reason = choice["finish_reason"]
+                delta = choice.get("delta") or {}
+                if delta.get("content"):
+                    content_parts.append(delta["content"])
+                reasoning = (
+                    delta.get("reasoning_content") or delta.get("reasoning")
+                )
+                if reasoning:
+                    reasoning_parts.append(reasoning)
+                for tc in delta.get("tool_calls") or []:
+                    try:
+                        pos = int(tc.get("index") or 0)
+                    except (TypeError, ValueError):
+                        pos = 0
+                    entry = tool_calls.get(pos)
+                    if entry is None:
+                        entry = {
+                            "id": tc.get("id") or f"tool_{uuid.uuid4().hex[:12]}",
+                            "type": "function",
+                            "function": {"name": "", "arguments": ""},
+                        }
+                        tool_calls[pos] = entry
+                    if tc.get("id"):
+                        entry["id"] = tc["id"]
+                    fn = tc.get("function") or {}
+                    if fn.get("name"):
+                        entry["function"]["name"] += fn["name"]
+                    if fn.get("arguments"):
+                        entry["function"]["arguments"] += fn["arguments"]
+    finally:
+        aclose = getattr(gen, "aclose", None)
+        if aclose is not None:
+            try:
+                await aclose()
+            except Exception:
+                pass
+    message: dict = {"role": "assistant"}
+    if reasoning_parts:
+        message["reasoning_content"] = "".join(reasoning_parts)
+    message["content"] = "".join(content_parts) if content_parts else None
+    ordered = [tool_calls[i] for i in sorted(tool_calls)]
+    if ordered:
+        message["tool_calls"] = ordered
+    return {
+        "id": response_id or f"chatcmpl-assembled-{uuid.uuid4().hex[:12]}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model or payload.get("model", ""),
+        "choices": [
+            {
+                "index": 0,
+                "message": message,
+                "finish_reason": finish_reason or "stop",
+            }
+        ],
+        "usage": usage,
     }
 
 
