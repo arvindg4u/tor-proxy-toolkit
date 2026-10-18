@@ -547,9 +547,9 @@ async def passthrough_responses(
     try:
         import json
         payload = json.loads(body)
-        is_stream = payload.get("stream", False)
+        is_stream = bool(payload.get("stream", False))
     except Exception:
-        pass
+        payload = {}
 
     if is_stream:
         stats.record("/v1/responses", status=200)
@@ -657,6 +657,42 @@ def _passthrough_error_frame(detail: str) -> bytes:
     return ("data: " + _json.dumps({"error": {"message": message}}) + "\n\n").encode()
 
 
+@router.get("/v1/models")
+async def list_models(_: None = Depends(validate_api_key)):
+    """Mirror the upstream models list (OpenAI shape) for client discovery/tests."""
+    url = f"{config.openai_base_url}/models"
+    headers = {
+        "Authorization": f"Bearer {config.openai_api_key}",
+        "Content-Type": "application/json",
+        **config.get_upstream_headers(),
+    }
+    try:
+        client = await get_shared_client()
+        resp = await client.get(url, headers=headers, timeout=config.request_timeout)
+        try:
+            data = resp.json()
+        except Exception:
+            data = {"error": {"type": "api_error", "message": scrub_api_keys(resp.text[:2000])}}
+        # Capability broadcast: advertise the tier's real limits so model
+        # registries (n8n assistant etc.) pick up context/output/reasoning.
+        if isinstance(data, dict) and isinstance(data.get("data"), list):
+            for m in data["data"]:
+                if isinstance(m, dict):
+                    m["context_length"] = 1000000
+                    m["max_output_tokens"] = config.max_tokens_limit
+                    m["supports_reasoning"] = True
+                    m["reasoning"] = True
+        return JSONResponse(status_code=resp.status_code, content=data)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"GET /v1/models failed: {e}")
+        return JSONResponse(
+            status_code=502,
+            content={"error": {"type": "api_error", "message": "Upstream unavailable, retry"}},
+        )
+
+
 @router.post("/v1/chat/completions")
 async def passthrough_chat_completions(
     request: Request, _: None = Depends(validate_api_key)
@@ -675,12 +711,38 @@ async def passthrough_chat_completions(
     params = dict(request.query_params)
 
     is_stream = False
+    payload: dict = {}
     try:
         import json
         payload = json.loads(body)
-        is_stream = payload.get("stream", False)
+        is_stream = bool(payload.get("stream", False))
     except Exception:
-        pass
+        payload = {}
+
+    if "opencode.ai" in (config.openai_base_url or "").lower() and payload:
+        # Free-tier gate: EVERY /chat/completions — streaming or not — must
+        # carry the genuine CLI tool manifest (tool-less/partial sets are
+        # rejected with FreeTierError), and upstream rejects stream:false.
+        # Shape the body once here; streaming goes straight through,
+        # non-streaming is streamed-and-assembled below.
+        import json
+        from src.core.cli_identity import chat_format_gate_tools
+        from src.conversion.request_converter import _gate_enabled
+        payload["tools"] = chat_format_gate_tools(
+            payload.get("tools") or [], enabled=_gate_enabled()
+        )
+        # max_tokens FLOOR: clients (n8n assistant, verifiers) send small
+        # caps; reasoning models burn the budget thinking before answering.
+        # The operator's MAX_TOKENS_LIMIT is the floor, never a ceiling.
+        payload["max_tokens"] = max(
+            payload.get("max_tokens") or 0,
+            config.max_tokens_limit,
+        )
+        payload.setdefault("temperature", 1.0)
+        if is_stream:
+            body = json.dumps(payload, ensure_ascii=False).encode()
+        else:
+            payload["stream"] = True
 
     if is_stream:
         stats.record("/v1/chat/completions", status=200)
@@ -695,6 +757,14 @@ async def passthrough_chat_completions(
         )
     else:
         try:
+            if "opencode.ai" in (config.openai_base_url or "").lower() and payload:
+                # Shaped above (manifest + stream:true): stream upstream and
+                # assemble one ChatCompletion dict for the non-streaming client.
+                data = await _collect_streamed_chat_response(
+                    openai_client, payload, str(uuid.uuid4()), request
+                )
+                stats.record("/v1/chat/completions", status=200)
+                return JSONResponse(status_code=200, content=data)
             client = await get_shared_client()
             resp = await client.post(
                 url, content=body, headers=headers, params=params,
