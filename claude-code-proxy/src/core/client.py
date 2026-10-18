@@ -146,19 +146,24 @@ class OpenAIClient:
             return completion.model_dump()
         
         except AuthenticationError as e:
+            logger.error(f"chat upstream 401: {str(e)[:220]}")
             raise HTTPException(status_code=401, detail=self.classify_openai_error(str(e)))
         except RateLimitError as e:
+            logger.error(f"chat upstream 429: {str(e)[:220]}")
             raise HTTPException(status_code=429, detail=self.classify_openai_error(str(e)))
         except BadRequestError as e:
+            logger.error(f"chat upstream 400: {str(e)[:220]}")
             raise HTTPException(status_code=400, detail=self.classify_openai_error(str(e)))
         except APIError as e:
             status_code = getattr(e, 'status_code', 500)
+            logger.error(f"chat upstream {status_code}: {str(e)[:220]}")
             if not _rotate_retried and await _recover_ip_abuse_403(e):
                 # Fresh peer confirmed: one transparent retry through the
                 # same call path (recursion depth capped by the flag).
                 return await self.create_chat_completion(request, request_id, _rotate_retried=True)
             raise HTTPException(status_code=status_code, detail=self.classify_openai_error(str(e)))
         except Exception as e:
+            logger.error(f"chat upstream unexpected: {str(e)[:220]}")
             raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
         
         finally:
@@ -213,15 +218,20 @@ class OpenAIClient:
             yield {"type": "done"}
                 
         except AuthenticationError as e:
+            logger.error(f"chat stream 401: {str(e)[:220]}")
             raise HTTPException(status_code=401, detail=self.classify_openai_error(str(e)))
         except RateLimitError as e:
+            logger.error(f"chat stream 429: {str(e)[:220]}")
             raise HTTPException(status_code=429, detail=self.classify_openai_error(str(e)))
         except BadRequestError as e:
+            logger.error(f"chat stream 400: {str(e)[:220]}")
             raise HTTPException(status_code=400, detail=self.classify_openai_error(str(e)))
         except APIError as e:
             status_code = getattr(e, 'status_code', 500)
+            logger.error(f"chat stream {status_code}: {str(e)[:220]}")
             raise HTTPException(status_code=status_code, detail=self.classify_openai_error(str(e)))
         except Exception as e:
+            logger.error(f"chat stream unexpected: {str(e)[:220]}")
             raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
         
         finally:
