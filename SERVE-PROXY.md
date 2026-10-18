@@ -119,6 +119,14 @@ OpenCode's ZEN gate demands agent-CLI identity on the *chat* wire:
    `context_length: 1000000, max_output_tokens: 128000,
    supports_reasoning: true, reasoning: true`.
 5. Reasoning is upstream default-on (`reasoning_content` in every completion).
+6. **IP-abuse 403 recovery** (the *"detected abusive traffic from this IP"*
+   variant): this flag is **IP-scoped** (verified: identical key/session/
+   headers pass on a different peer minutes later). auto.sh owns rotation —
+   its zen-log scan (every 10s) catches the 403 and rotates; `client.py`
+   then waits for a **new `live:` line in `auto.log`** (≤60s) and transparently
+   retries the upstream attempt exactly once, on both streaming and
+   non-streaming paths (pre-yield, so nothing is duplicated). If no rotation
+   completes in 60s the original error surfaces unchanged.
 
 ## 6. Endpoints (all key-gated)
 
@@ -151,6 +159,7 @@ curl -o /dev/null -w '%{http_code}\n' https://rvndha.duckdns.org:4014/v1/models
 | `Request cannot be constructed… credentials` | `user:pass@` in a browser fetch | use the API-key field (header door already open) |
 | `FreeTierError` on `/chat/completions` while `/v1/messages` passes | missing CLI manifest (streaming branch!) or stale proxy | this commit; `claude-zen restart` |
 | `429 FreeUsageLimitError` | free-tier rate window burned | wait it out (pattern: self-lifts); `gatewatch` heartbeat; Rotate peer if IP-scoped |
+| `403 FreeTierError` "abusive traffic from this IP" | **IP-scoped** abuse flag on the shared Proton relay | auto.sh rotates on it (10s scan); the proxy waits for the new `live:` line and retries once — you may never see this one |
 | tunnel "fully dark" bursts | Proton free peer death mode | auto.sh rotates on its own; check `auto.log` |
 
 ## 9. Secrets & hygiene
