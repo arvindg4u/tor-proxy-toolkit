@@ -98,7 +98,11 @@ bridge + trusts the self-signed cert:
     extra_hosts:
       - 'rvndha.duckdns.org:host-gateway'   # → 172.17.0.1:4014
     environment:
-      NODE_TLS_REJECT_UNAUTHORIZED: '0'      # gateway.crt is self-signed (CN = the v6 literal)
+      NODE_TLS_REJECT_UNAUTHORIZED: '0'      # legacy: kept from the self-signed-cert
+                                             # era; :4014 now serves the real Let's
+                                             # Encrypt cert, so this can be dropped
+                                             # on the next container recreate (strict
+                                             # validation verified from inside first).
 ```
 
 ## 5. Free-tier gate compliance (claude-code-proxy changes)
@@ -169,6 +173,10 @@ curl -o /dev/null -w '%{http_code}\n' https://rvndha.duckdns.org:4014/v1/models
 - `sk-local-claude-code` is the *proxy* key (weak by design) — the door is the
   htpasswd + header-key equality. Change both together: `.env ANTHROPIC_API_KEY`
   + the two nginx maps, then `claude-zen restart` + `nginx -s reload`.
-- The gateway cert is self-signed with CN = the v6 literal; browsers click
-  through, Node needs `NODE_TLS_REJECT_UNAUTHORIZED=0` (or replace with a real
-  cert + NODE_EXTRA_CA_CERTS).
+- TLS: `:4014` (like the n8n + homeassistant vhosts) serves the **real Let's
+  Encrypt cert** for `rvndha.duckdns.org` — issued via certbot webroot
+  (`/var/www/certbot`), auto-renewed by `certbot.timer`, and the deploy hook
+  `reload-nginx.sh` reloads nginx after each renewal. Any client that trusts
+  public CAs (curl, Java/JVM, Node, browsers) validates cleanly — no `-k`,
+  no truststore imports. The legacy self-signed `/etc/nginx/ssl/gateway.crt`
+  (CN = the v6 literal) still fronts only the wgtunnel/openclaw dashboards.
