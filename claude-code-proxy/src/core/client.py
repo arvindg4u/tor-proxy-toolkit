@@ -58,7 +58,7 @@ async def _recover_ip_abuse_403(e: APIError) -> bool:
             return False
         if "abusive traffic from this ip" not in str(e).lower():
             return False
-        logger.warning("opencode IP-abuse 403 seen; waiting for auto.sh rotation before one retry")
+        logger.warning("opencode IP-abuse 403 seen (abusive traffic from this IP); waiting for auto.sh rotation before one retry")
         ok = await _await_peer_rotation()
         if ok:
             logger.info("peer rotation confirmed; retrying once")
