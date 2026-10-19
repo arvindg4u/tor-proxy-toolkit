@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import time
 from fastapi import HTTPException
 from typing import Optional, AsyncGenerator, Dict, Any
 from openai import AsyncOpenAI, AsyncAzureOpenAI
@@ -8,6 +9,56 @@ from openai.types.chat import ChatCompletion, ChatCompletionChunk
 from openai._exceptions import APIError, RateLimitError, AuthenticationError, BadRequestError
 
 logger = logging.getLogger(__name__)
+
+# 429 local circuit breaker. The free tier's window is key-scoped: when it
+# is exhausted every upstream request answers 429 regardless of peer, and a
+# client retry storm (Claude CLI auto-retry every few seconds) both wastes
+# requests and — if the limiter counts requests per interval — can hold the
+# bucket at zero so it never refills. After an upstream 429 we therefore
+# reject new requests LOCALLY with backoff (10→20→40→60 s cap) without
+# touching the tunnel, and reset on the first success. This keeps the
+# operator's rotate-on-429 semantics for real hits while letting the
+# window refill undisturbed.
+_RATE_GUARD_UNTIL = 0.0
+_RATE_GUARD_FAILS = 0
+_RATE_GUARD_BASE = 10.0
+_RATE_GUARD_MAX = 60.0
+
+
+def _rate_guard_remaining() -> float:
+    return max(0.0, _RATE_GUARD_UNTIL - time.monotonic())
+
+
+def _rate_guard_trip() -> float:
+    global _RATE_GUARD_UNTIL, _RATE_GUARD_FAILS
+    _RATE_GUARD_FAILS = min(_RATE_GUARD_FAILS + 1, 6)
+    delay = min(_RATE_GUARD_BASE * (2 ** (_RATE_GUARD_FAILS - 1)), _RATE_GUARD_MAX)
+    _RATE_GUARD_UNTIL = time.monotonic() + delay
+    logger.warning(
+        f"local rate guard: upstream 429 (#{_RATE_GUARD_FAILS}), holding requests for {delay:.0f}s so the window can refill"
+    )
+    return delay
+
+
+def _rate_guard_reset() -> None:
+    global _RATE_GUARD_UNTIL, _RATE_GUARD_FAILS
+    if _RATE_GUARD_FAILS:
+        logger.info("local rate guard: upstream accepted a request, guard cleared")
+    _RATE_GUARD_UNTIL = 0.0
+    _RATE_GUARD_FAILS = 0
+
+
+def _rate_guard_check() -> None:
+    rem = _rate_guard_remaining()
+    if rem > 0:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"Rate limit exceeded. Free-tier window is recovering; "
+                f"held locally for {rem:.0f}s more (no upstream request made)."
+            ),
+            headers={"Retry-After": str(int(rem) + 1)},
+        )
 
 # IP-abuse recovery: opencode gates a flagged egress IP with a 403
 # FreeTierError ("detected abusive traffic from this IP address"). The flag
@@ -105,6 +156,7 @@ class OpenAIClient:
     
     async def create_chat_completion(self, request: Dict[str, Any], request_id: Optional[str] = None, _rotate_retried: bool = False) -> Dict[str, Any]:
         """Send chat completion to OpenAI API with cancellation support."""
+        _rate_guard_check()
         
         # Create cancellation token if request_id provided
         if request_id:
@@ -143,6 +195,7 @@ class OpenAIClient:
                 completion = await completion_task
             
             # Convert to dict format that matches the original interface
+            _rate_guard_reset()
             return completion.model_dump()
         
         except AuthenticationError as e:
@@ -150,6 +203,7 @@ class OpenAIClient:
             raise HTTPException(status_code=401, detail=self.classify_openai_error(str(e)))
         except RateLimitError as e:
             logger.error(f"chat upstream 429: {str(e)[:220]}")
+            _rate_guard_trip()
             raise HTTPException(status_code=429, detail=self.classify_openai_error(str(e)))
         except BadRequestError as e:
             logger.error(f"chat upstream 400: {str(e)[:220]}")
@@ -178,6 +232,7 @@ class OpenAIClient:
         ``{"type": "done"}``) instead of pre-serialized ``"data: ..."`` strings,
         so the converter serializes exactly once at the SSE boundary.
         """
+        _rate_guard_check()
         
         # Create cancellation token if request_id provided
         if request_id:
@@ -197,6 +252,7 @@ class OpenAIClient:
             # and retry once here, fully transparent to the client.
             try:
                 streaming_completion = await self.client.chat.completions.create(**request)
+                _rate_guard_reset()
             except APIError as e:
                 if not _rotate_retried and await _recover_ip_abuse_403(e):
                     streaming_completion = await self.client.chat.completions.create(**request)
@@ -222,6 +278,7 @@ class OpenAIClient:
             raise HTTPException(status_code=401, detail=self.classify_openai_error(str(e)))
         except RateLimitError as e:
             logger.error(f"chat stream 429: {str(e)[:220]}")
+            _rate_guard_trip()
             raise HTTPException(status_code=429, detail=self.classify_openai_error(str(e)))
         except BadRequestError as e:
             logger.error(f"chat stream 400: {str(e)[:220]}")
