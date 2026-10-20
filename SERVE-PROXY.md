@@ -141,6 +141,52 @@ OpenCode's ZEN gate demands agent-CLI identity on the *chat* wire:
 | `GET  /v1/models` | OpenAI + metadata | mirror + capability broadcast |
 | `GET  /health` | — | 401 without the door |
 
+**Base URL — both forms work.** `https://rvndha.duckdns.org:4014/v1` and the bare
+`https://rvndha.duckdns.org:4014` (nginx rewrites `/chat/completions` →
+`/v1/chat/completions`). Verified 2026-10-19. Auth accepts either
+`Authorization: Bearer <key>` or `x-api-key: <key>`.
+
+## 6a. Client compatibility matrix
+
+Which platforms can be pointed at this proxy. "OpenAI" = `POST /v1/chat/completions`,
+"Anthropic" = `POST /v1/messages`. Both wire shapes are live and verified.
+
+| Platform | OpenAI | Anthropic | Config key |
+|---|---|---|---|
+| Claude Code CLI / Agent SDK | — | ✅ | `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` |
+| OpenClaw | ✅ | — | provider `baseUrl` + `api: openai-completions` |
+| OpenCode | ✅ | ✅ | `opencode.jsonc` → `providers.<id>.settings.baseURL` |
+| Cline | ✅ | ✅ | provider "OpenAI Compatible" / "Anthropic" → Base URL |
+| Roo Code | ✅ | ✅ | Anthropic provider's *Custom Base URL*, or OpenAI-compatible mode |
+| Kilo Code | ✅ | ✅ | OpenAI Compatible provider (auto-discovers via `/v1/models`) |
+| Continue.dev | ✅ | ✅ | `config.yaml` → `apiBase` |
+| Aider | ✅ | — | `OPENAI_API_BASE`, model prefix `openai/<model>` |
+| LibreChat | ✅ | ✅ | `librechat.yaml` → `baseURL` (+ `provider: anthropic`) |
+| Open WebUI | ✅ | — | Admin → Settings → Connections → OpenAI + Base URL |
+| LobeChat | ✅ | ✅ | Settings → AI Providers → Add Custom Provider |
+| Dify | ✅ | — | plugin "OpenAI-API-compatible" → URL + Key |
+| n8n | ✅ | — | OpenAI credential → Base URL |
+| Zed | ✅ | ✅ | `settings.json` → `openai_compatible` / `anthropic` `api_url` |
+| Goose (Block) | ✅ | ✅ | `OPENAI_HOST` + `OPENAI_BASE_PATH`, or `ANTHROPIC_HOST` |
+| Crush (Charm) | ✅ | — | provider `--type openai-compat` |
+| Cursor / Windsurf | ⚠️ | — | "Override OpenAI Base URL" — applies to *all* models, so Cursor's own models break while it's on |
+
+**Gotchas that actually bite:**
+- **`/v1` suffix** — both accepted here, which is unusual. Most tools want the suffix
+  on the OpenAI side and *not* on the Anthropic side (the Anthropic SDK appends
+  `/v1/messages` itself). Use `.../v1` for OpenAI clients, `...` bare for Anthropic.
+- **Tool names must not collide with the manifest.** Lowercase builtins (`bash`,
+  `read`, `edit`, `write`, `glob`, `grep`, `todowrite`, `task`, `skill`, `webfetch`,
+  `websearch`) now dedupe cleanly (fixed 2026-10-19). Anything else passes through.
+- **`/v1/models` carries `context_length`, `max_output_tokens`, `supports_reasoning`**
+  so auto-discovery UIs (Kilo, LibreChat `fetch: true`) populate correctly.
+- **Non-standard port 4014** — fine for CLIs and servers; some browser-based UIs with
+  strict CORS/preflight may need the proxy reached over 443 instead.
+- **Cursor/Windsurf** are the only real "no": the override is global, not per-model.
+- **Free-tier rate window** — `FreeUsageLimitError` 429s appear under bursty parallel
+  load (it killed two background research agents during this session). Serial use is
+  fine; wait it out or rotate the Proton peer via `auto.log`.
+
 ## 7. Verification matrix (curl)
 
 ```bash
@@ -165,6 +211,7 @@ curl -o /dev/null -w '%{http_code}\n' https://rvndha.duckdns.org:4014/v1/models
 | `429 FreeUsageLimitError` | free-tier rate window burned | wait it out (pattern: self-lifts); `gatewatch` heartbeat; Rotate peer if IP-scoped |
 | `403 FreeTierError` "abusive traffic from this IP" | **IP-scoped** abuse flag on the shared Proton relay | auto.sh rotates on it (10s scan); the proxy waits for the new `live:` line and retries once — you may never see this one |
 | tunnel "fully dark" bursts | Proton free peer death mode | auto.sh rotates on its own; check `auto.log` |
+| every ~58 min: `lookup … on 10.2.0.1: i/o timeout`, yet keepalives continue | Proton free **session cliff** — the in-tunnel resolver stops answering 55–59 min after a peer starts; every hostname-based request dies with it | fixed proactively: `auto.sh` rotates at **50 min** (`WG_ROTATE_INTERVAL`, default 3000 s), timed from the live peer's launch, so the cliff is never reached |
 
 ## 9. Secrets & hygiene
 
