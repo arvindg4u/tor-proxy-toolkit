@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException, Request, Header, Depends
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from datetime import datetime
 import asyncio
 import os
@@ -552,7 +552,11 @@ async def passthrough_responses(
         payload = {}
 
     if is_stream:
-        stats.record("/v1/responses", status=200)
+        stats.record(
+            "/v1/responses",
+            status=200,
+            model=payload.get("model") if isinstance(payload, dict) else None,
+        )
         return StreamingResponse(
             _passthrough_stream_gen(request, url, body, headers, params),
             media_type="text/event-stream",
@@ -569,7 +573,11 @@ async def passthrough_responses(
                 url, content=body, headers=headers, params=params,
                 timeout=config.request_timeout,
             )
-            stats.record("/v1/responses", status=resp.status_code)
+            stats.record(
+                "/v1/responses",
+                status=resp.status_code,
+                model=payload.get("model") if isinstance(payload, dict) else None,
+            )
             try:
                 data = resp.json()
             except Exception:
@@ -600,6 +608,7 @@ async def _passthrough_stream_gen(request, url, body, headers, params):
     """
     import json as _json
 
+    stats.record_stream()
     keepalive = config.stream_keepalive_secs if config.stream_keepalive_secs > 0 else 15.0
     pending = None
     try:
@@ -727,10 +736,17 @@ async def passthrough_chat_completions(
         # non-streaming is streamed-and-assembled below.
         import json
         from src.core.cli_identity import chat_format_gate_tools
-        from src.conversion.request_converter import _gate_enabled
+        from src.conversion.request_converter import (
+            _gate_enabled,
+            ensure_chat_reasoning_replay,
+        )
         payload["tools"] = chat_format_gate_tools(
             payload.get("tools") or [], enabled=_gate_enabled()
         )
+        # Standard OpenAI clients drop the non-standard reasoning_content
+        # field from prior assistant turns; the thinking-mode upstream then
+        # rejects the whole tool-calling conversation.
+        ensure_chat_reasoning_replay(payload)
         # max_tokens FLOOR: clients (n8n assistant, verifiers) send small
         # caps; reasoning models burn the budget thinking before answering.
         # The operator's MAX_TOKENS_LIMIT is the floor, never a ceiling.
@@ -745,7 +761,11 @@ async def passthrough_chat_completions(
             payload["stream"] = True
 
     if is_stream:
-        stats.record("/v1/chat/completions", status=200)
+        stats.record(
+            "/v1/chat/completions",
+            status=200,
+            model=payload.get("model") if isinstance(payload, dict) else None,
+        )
         return StreamingResponse(
             _passthrough_stream_gen(request, url, body, headers, params),
             media_type="text/event-stream",
@@ -763,14 +783,23 @@ async def passthrough_chat_completions(
                 data = await _collect_streamed_chat_response(
                     openai_client, payload, str(uuid.uuid4()), request
                 )
-                stats.record("/v1/chat/completions", status=200)
+                stats.record(
+                    "/v1/chat/completions",
+                    status=200,
+                    model=payload.get("model") if isinstance(payload, dict) else None,
+                    usage=data.get("usage") if isinstance(data, dict) else None,
+                )
                 return JSONResponse(status_code=200, content=data)
             client = await get_shared_client()
             resp = await client.post(
                 url, content=body, headers=headers, params=params,
                 timeout=config.request_timeout,
             )
-            stats.record("/v1/chat/completions", status=resp.status_code)
+            stats.record(
+                "/v1/chat/completions",
+                status=resp.status_code,
+                model=payload.get("model") if isinstance(payload, dict) else None,
+            )
             try:
                 data = resp.json()
             except Exception:
@@ -781,7 +810,16 @@ async def passthrough_chat_completions(
                     }
                 }
             return JSONResponse(status_code=resp.status_code, content=data)
-        except HTTPException:
+        except HTTPException as e:
+            # Client-facing failure path (e.g. the upstream rejected the
+            # request before any stream bytes). Count it like every other
+            # failed request; the final failure itself is recorded by the
+            # client layer.
+            stats.record(
+                "/v1/chat/completions",
+                status=e.status_code,
+                model=payload.get("model") if isinstance(payload, dict) else None,
+            )
             raise
         except Exception as e:
             logger.error(f"Passthrough /v1/chat/completions failed: {e}")
@@ -790,6 +828,70 @@ async def passthrough_chat_completions(
                 status_code=502,
                 content={"error": {"type": "api_error", "message": "Upstream unavailable, retry"}},
             )
+
+
+_FAILURE_HISTORY_CACHE: tuple = (None, [])
+_FAILURE_HISTORY_LIMIT = 20
+
+
+def _failure_at(value) -> float:
+    """Best-effort numeric failure timestamp for sorting."""
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _failure_history(log_dir: str) -> list:
+    """Read archived failures, cached until the failure files change.
+
+    The dashboard polls every 5s. Re-reading up to 50 JSON files on every
+    poll would be needless disk churn; the directory/last-record mtimes are a
+    cheap invalidation key because ``failure_log`` touches both on a new
+    final failure.
+    """
+    global _FAILURE_HISTORY_CACHE
+    failures_dir = os.path.join(log_dir, "failures")
+    signature = [os.path.abspath(log_dir)]
+    for path in (
+        os.path.join(log_dir, "last_upstream_failure.json"),
+        failures_dir,
+    ):
+        try:
+            signature.append(os.stat(path).st_mtime_ns)
+        except OSError:
+            signature.append(0)
+    key = tuple(signature)
+    if _FAILURE_HISTORY_CACHE[0] == key:
+        return list(_FAILURE_HISTORY_CACHE[1])
+
+    import glob as _glob
+    import json as _json
+
+    history: list = []
+    try:
+        for ap in _glob.glob(os.path.join(failures_dir, "failure-*.json")):
+            try:
+                with open(ap) as f:
+                    d = _json.load(f)
+                if isinstance(d, dict):
+                    history.append(
+                        {
+                            "status": d.get("status"),
+                            "error": scrub_api_keys(str(d.get("error", ""))[:300]),
+                            "model": d.get("model"),
+                            "request_id": d.get("request_id"),
+                            "at": d.get("at", 0),
+                        }
+                    )
+            except Exception:
+                continue
+    except Exception:
+        history = []
+    history.sort(key=lambda x: _failure_at(x.get("at")), reverse=True)
+    history = history[:_FAILURE_HISTORY_LIMIT]
+    _FAILURE_HISTORY_CACHE = (key, history)
+    return list(history)
 
 
 @router.get("/api/status")
@@ -801,12 +903,10 @@ async def api_status():
     new shape ({status, error, model, request_id, at}).
     """
     last_failure = None
-    failure_history: list = []
-    import glob as _glob
     import json as _json
 
+    log_dir = os.environ.get("PROXY_LOG_DIR", "logs")
     try:
-        log_dir = os.environ.get("PROXY_LOG_DIR", "logs")
         path = os.path.join(log_dir, "last_upstream_failure.json")
         if os.path.exists(path):
             with open(path) as f:
@@ -827,51 +927,96 @@ async def api_status():
                 }
     except Exception:
         last_failure = None
+    failure_history = _failure_history(log_dir)
+
+    # Show only a host:port label for the local egress proxy; credentials in
+    # proxy URLs (if any) must never reach the browser.
+    proxy_label = "direct"
     try:
-        arch = sorted(
-            _glob.glob(os.path.join(log_dir, "failures", "failure-*.json")),
-            reverse=True,
-        )[:20]
-        for ap in arch:
-            try:
-                with open(ap) as f:
-                    d = _json.load(f)
-                if isinstance(d, dict):
-                    failure_history.append(
-                        {
-                            "status": d.get("status"),
-                            "error": scrub_api_keys(str(d.get("error", ""))[:300]),
-                            "model": d.get("model"),
-                            "at": d.get("at", 0),
-                        }
-                    )
-            except Exception:
-                continue
+        from urllib.parse import urlsplit
+
+        raw_proxy = (
+            os.environ.get("HTTPS_PROXY")
+            or os.environ.get("https_proxy")
+            or os.environ.get("HTTP_PROXY")
+            or os.environ.get("http_proxy")
+            or ""
+        )
+        if raw_proxy:
+            parsed = urlsplit(raw_proxy)
+            if parsed.hostname:
+                proxy_label = parsed.hostname
+                if parsed.port:
+                    proxy_label += f":{parsed.port}"
     except Exception:
-        failure_history = []
-    return {
-        "proxy": {
-            "openai_base_url": config.openai_base_url,
-            "wire_api": config.upstream_wire_api,
-            "upstream_user_agent": config.upstream_user_agent,
-            "max_tokens_limit": config.max_tokens_limit,
-            "request_timeout": config.request_timeout,
-            "retry_budget_secs": config.responses_retry_budget_secs,
-            "keepalive_secs": config.stream_keepalive_secs,
-            "client_key_validation": bool(config.anthropic_api_key),
-            "models": {
-                "big": config.big_model,
-                "middle": config.middle_model,
-                "small": config.small_model,
+        proxy_label = "direct"
+
+    return JSONResponse(
+        content={
+            "proxy": {
+                "openai_base_url": config.openai_base_url,
+                "public_base_url": config.public_base_url,
+                "upstream_proxy": proxy_label,
+                "wire_api": config.upstream_wire_api,
+                "upstream_user_agent": config.upstream_user_agent,
+                "max_tokens_limit": config.max_tokens_limit,
+                "request_timeout": config.request_timeout,
+                "retry_budget_secs": config.responses_retry_budget_secs,
+                "keepalive_secs": config.stream_keepalive_secs,
+                "client_key_validation": bool(config.anthropic_api_key),
+                "pid": os.getpid(),
+                "models": {
+                    "big": config.big_model,
+                    "middle": config.middle_model,
+                    "small": config.small_model,
+                },
             },
+            "stats": stats.snapshot(),
+            "last_upstream_failure": last_failure,
+            "failure_history": failure_history,
+            "generated_at": time.time(),
         },
-        "stats": stats.snapshot(),
-        "last_upstream_failure": last_failure,
-        "failure_history": failure_history,
-    }
+        headers={
+            "Cache-Control": "no-store, max-age=0",
+            "Pragma": "no-cache",
+            "X-Content-Type-Options": "nosniff",
+            "X-Robots-Tag": "noindex, nofollow",
+        },
+    )
 
 
 @router.get("/")
 async def root():
     """Native status dashboard (HTML). JSON moved to /api/status."""
     return dashboard_response()
+
+
+@router.head("/")
+async def root_head():
+    """HEAD probe for the dashboard (no body)."""
+    return Response(
+        status_code=200,
+        media_type="text/html; charset=utf-8",
+        headers={
+            "Cache-Control": "no-store, max-age=0",
+            "X-Content-Type-Options": "nosniff",
+            "X-Frame-Options": "DENY",
+            "Referrer-Policy": "no-referrer",
+            "X-Robots-Tag": "noindex, nofollow",
+        },
+    )
+
+
+@router.head("/api/status")
+async def api_status_head():
+    """HEAD probe for the dashboard feed (no body)."""
+    return Response(
+        status_code=200,
+        media_type="application/json",
+        headers={
+            "Cache-Control": "no-store, max-age=0",
+            "Pragma": "no-cache",
+            "X-Content-Type-Options": "nosniff",
+            "X-Robots-Tag": "noindex, nofollow",
+        },
+    )

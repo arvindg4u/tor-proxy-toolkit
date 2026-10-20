@@ -15,12 +15,17 @@ import json
 import logging
 import os
 import sys
+from unittest.mock import patch
 
 os.environ.setdefault("OPENAI_API_KEY", "sk-test-dummy")
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from src.conversion.request_converter import convert_claude_to_openai  # noqa: E402
+from src.conversion.request_converter import (  # noqa: E402
+    convert_claude_to_openai,
+    ensure_chat_reasoning_replay,
+)
+from src.core.config import config  # noqa: E402
 from src.conversion.request_responses import convert_claude_to_responses  # noqa: E402
 from src.conversion.response_responses import (  # noqa: E402
     convert_responses_streaming_to_claude_with_cancellation,
@@ -222,11 +227,13 @@ def test_history_with_thinking_blocks_parses_and_converts():
     """Regression: 422 on history echoing proxy-emitted thinking blocks.
 
     Claude Code passes thinking blocks back in the next turn's history.
-    The request models must accept them (converters drop them upstream).
+    The request models must accept them, and the chat converter must replay
+    the text as upstream ``reasoning_content``.
     """
     raw = {
         "model": "claude-opus-4-8",
         "max_tokens": 100,
+        "thinking": {"type": "enabled", "budget_tokens": 2048},
         "messages": [
             {"role": "user", "content": "do it"},
             {
@@ -264,6 +271,130 @@ def test_history_with_thinking_blocks_parses_and_converts():
     chat = convert_claude_to_openai(req, StubModelManager())
     tool_calls = chat["messages"][1].get("tool_calls", [])
     assert len(tool_calls) == 1, chat["messages"]
+    # DeepSeek thinking mode: history reasoning must round-trip upstream.
+    assert (
+        chat["messages"][1].get("reasoning_content") == "Verifying conventions"
+    ), chat["messages"][1]
+
+
+def test_assistant_without_thinking_replays_empty_reasoning():
+    """Thinking + tools requires the field on every assistant turn."""
+    raw = {
+        "model": "claude-opus-4-8",
+        "max_tokens": 100,
+        "thinking": {"type": "enabled", "budget_tokens": 2048},
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "continue"},
+        ],
+    }
+    req = ClaudeMessagesRequest.model_validate(raw)
+    chat = convert_claude_to_openai(req, StubModelManager())
+    assert chat["messages"][1].get("reasoning_content") == "", chat["messages"][1]
+
+
+def test_gate_replays_reasoning_without_thinking_config():
+    """OpenCode thinks by default; gate tool history still needs the field."""
+    raw = {
+        "model": "claude-opus-4-8",
+        "max_tokens": 100,
+        "tools": [
+            {
+                "name": "mytool",
+                "description": "Echo a value",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                    "required": ["value"],
+                },
+            }
+        ],
+        "messages": [
+            {"role": "user", "content": "call mytool"},
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "call_1",
+                        "name": "mytool",
+                        "input": {"value": "hi"},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "call_1",
+                        "content": "hi",
+                    }
+                ],
+            },
+        ],
+    }
+    req = ClaudeMessagesRequest.model_validate(raw)
+    with patch.object(config, "openai_base_url", "https://opencode.ai/zen/v1"):
+        chat = convert_claude_to_openai(req, StubModelManager())
+    assert chat["messages"][1].get("reasoning_content") == "", chat["messages"][1]
+    assert chat["messages"][1].get("tool_calls"), chat["messages"][1]
+
+
+def test_chat_passthrough_replays_missing_reasoning():
+    """Raw OpenAI clients drop reasoning_content; fill it before upstream."""
+    payload = {
+        "tools": [{"type": "function", "function": {"name": "mytool"}}],
+        "messages": [
+            {"role": "system", "content": "sys"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{"id": "call_1", "type": "function"}],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+            {
+                "role": "assistant",
+                "content": "done",
+                "reasoning_content": "kept reasoning",
+            },
+        ],
+    }
+    ensure_chat_reasoning_replay(payload)
+    assert payload["messages"][1]["reasoning_content"] == ""
+    assert payload["messages"][3]["reasoning_content"] == "kept reasoning"
+    assert "reasoning_content" not in payload["messages"][0]
+
+    no_tools = {
+        "messages": [{"role": "assistant", "content": "hi"}],
+    }
+    ensure_chat_reasoning_replay(no_tools)
+    assert "reasoning_content" not in no_tools["messages"][0]
+
+
+def test_history_reasoning_replayed_without_current_thinking_config():
+    """History thinking is enough to trigger reasoning replay."""
+    raw = {
+        "model": "claude-opus-4-8",
+        "max_tokens": 100,
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "Earlier reasoning"},
+                    {"type": "text", "text": "hello"},
+                ],
+            },
+            {"role": "user", "content": "continue"},
+        ],
+    }
+    req = ClaudeMessagesRequest.model_validate(raw)
+    chat = convert_claude_to_openai(req, StubModelManager())
+    assert (
+        chat["messages"][1].get("reasoning_content") == "Earlier reasoning"
+    ), chat["messages"][1]
 
 
 if __name__ == "__main__":
@@ -272,4 +403,8 @@ if __name__ == "__main__":
     test_no_thinking_when_disabled()
     test_non_streaming_thinking_parity()
     test_history_with_thinking_blocks_parses_and_converts()
-    print("test_thinking_stream: all 5 tests passed")
+    test_assistant_without_thinking_replays_empty_reasoning()
+    test_gate_replays_reasoning_without_thinking_config()
+    test_chat_passthrough_replays_missing_reasoning()
+    test_history_reasoning_replayed_without_current_thinking_config()
+    print("test_thinking_stream: all 9 tests passed")

@@ -1,8 +1,10 @@
 """In-memory request statistics for the status dashboard.
 
-Single-process counters only (no persistence). Tokens are tracked for
-non-streaming responses where upstream returns a usage block; streaming
-responses contribute request counts but no token counts.
+Single-process counters only (no persistence). Tokens are tracked from
+each upstream usage block, including the final usage event of a stream.
+Streaming failures are folded into the request outcome so
+``ok_requests + errors == total_requests`` and ``by_status`` stays a
+faithful final-status histogram.
 """
 
 import math
@@ -128,6 +130,7 @@ class ProxyStats:
         self.total_requests = 0
         self.ok_requests = 0
         self.errors = 0
+        self.stream_errors = 0
         self.by_endpoint: Dict[str, int] = {}
         self.by_model: Dict[str, int] = {}
         self.by_status: Dict[str, int] = {}
@@ -289,8 +292,10 @@ class ProxyStats:
     def record_stream_error(self, status: int = 500) -> None:
         """Count a post-header streaming failure.
 
-        The accept was already recorded as 200 (optimistic start), so this
-        only bumps errors/by_status/last_error_at — never total_requests.
+        The accept was already recorded as an optimistic 200, so replace
+        that outcome instead of adding a second request: ``total_requests``
+        stays put, the 200 leaves ``ok_requests``/``by_status``, and the
+        final error status takes its place.
         """
         try:
             code = int(status)
@@ -298,7 +303,16 @@ class ProxyStats:
             code = 500
         with self._lock:
             self.errors += 1
+            self.stream_errors += 1
             self.last_error_at = time.time()
+            if self.ok_requests > 0:
+                self.ok_requests -= 1
+            accepted = self.by_status.get("200", 0)
+            if accepted > 0:
+                if accepted == 1:
+                    self.by_status.pop("200", None)
+                else:
+                    self.by_status["200"] = accepted - 1
             key = str(code)
             self.by_status[key] = self.by_status.get(key, 0) + 1
 
@@ -517,7 +531,9 @@ class ProxyStats:
                 "total_requests": self.total_requests,
                 "ok_requests": self.ok_requests,
                 "errors": self.errors,
+                "stream_errors": self.stream_errors,
                 "error_rate": (self.errors / self.total_requests) if self.total_requests else 0.0,
+                "success_rate": (self.ok_requests / self.total_requests) if self.total_requests else 0.0,
                 "last_error_at": self.last_error_at,
                 "avg_latency_ms": round(avg_latency * 1000, 1),
                 "streams": self.streams,

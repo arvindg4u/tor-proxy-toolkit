@@ -19,6 +19,31 @@ def _gate_enabled() -> bool:
     return "opencode.ai" in base
 
 
+def ensure_chat_reasoning_replay(payload: Dict[str, Any]) -> None:
+    """Replay a placeholder for missing assistant ``reasoning_content``.
+
+    DeepSeek thinking mode requires every prior assistant turn to carry
+    ``reasoning_content`` when the request has tools. Standard OpenAI clients
+    (and many SDKs) drop that non-standard field when building the next
+    request, then the upstream rejects the whole conversation with
+    ``The `reasoning_content` in the thinking mode must be passed back``.
+    An explicit empty string satisfies the validator; when the client did
+    preserve the real reasoning text it is left untouched.
+    """
+    if not payload.get("tools"):
+        return
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") != Constants.ROLE_ASSISTANT:
+            continue
+        if message.get("reasoning_content") is None:
+            message["reasoning_content"] = ""
+
+
 def convert_claude_to_openai(
     claude_request: ClaudeMessagesRequest, model_manager
 ) -> Dict[str, Any]:
@@ -26,6 +51,29 @@ def convert_claude_to_openai(
 
     # Map model
     openai_model = model_manager.map_claude_model_to_openai(claude_request.model)
+    thinking_enabled = bool(
+        claude_request.thinking and claude_request.thinking.type == "enabled"
+    )
+    # A replay can contain thinking blocks even when the current turn omits
+    # the thinking config. Keep the reasoning chain in that case too; the
+    # upstream ignores the extra field outside thinking mode, but needs it
+    # when a tool-calling thinking session is continued.
+    history_has_thinking = any(
+        isinstance(msg.content, list)
+        and any(
+            getattr(block, "type", None) == Constants.CONTENT_THINKING
+            for block in msg.content
+        )
+        for msg in claude_request.messages
+        if msg.role == Constants.ROLE_ASSISTANT
+    )
+    # The OpenCode gate adds the CLI tool manifest to every request and its
+    # DeepSeek models think by default, even when the client omits the Claude
+    # thinking config. Their validator requires replayed reasoning on assistant
+    # turns once tools are present, so cover the gate path too.
+    include_reasoning = (
+        thinking_enabled or history_has_thinking or _gate_enabled()
+    )
 
     # Convert messages
     openai_messages = []
@@ -79,7 +127,9 @@ def convert_claude_to_openai(
             openai_message = convert_claude_user_message(msg)
             openai_messages.append(openai_message)
         elif msg.role == Constants.ROLE_ASSISTANT:
-            openai_message = convert_claude_assistant_message(msg)
+            openai_message = convert_claude_assistant_message(
+                msg, include_reasoning=include_reasoning
+            )
             openai_messages.append(openai_message)
 
             # Check if next message contains tool results
@@ -215,21 +265,38 @@ def convert_claude_user_message(msg: ClaudeMessage) -> Dict[str, Any]:
         return {"role": Constants.ROLE_USER, "content": openai_content}
 
 
-def convert_claude_assistant_message(msg: ClaudeMessage) -> Dict[str, Any]:
-    """Convert Claude assistant message to OpenAI format."""
+def convert_claude_assistant_message(
+    msg: ClaudeMessage, include_reasoning: bool = False
+) -> Dict[str, Any]:
+    """Convert Claude assistant message to OpenAI format.
+
+    DeepSeek thinking mode requires the previous turn's ``reasoning_content``
+    to be replayed whenever the request carries tools. Claude Code echoes the
+    proxy-emitted thinking block in history, so map it back to the upstream
+    field. Assistant turns without a thinking block get an explicit empty
+    ``reasoning_content`` (the strict upstream rejects a missing field once a
+    tool-calling thinking session is in progress).
+    """
     text_parts = []
     tool_calls = []
+    reasoning_parts = []
+
+    def _finish(message: Dict[str, Any]) -> Dict[str, Any]:
+        if include_reasoning:
+            message["reasoning_content"] = "\n".join(reasoning_parts)
+        return message
 
     if msg.content is None:
-        return {"role": Constants.ROLE_ASSISTANT, "content": None}
-    
+        return _finish({"role": Constants.ROLE_ASSISTANT, "content": None})
+
     if isinstance(msg.content, str):
-        return {"role": Constants.ROLE_ASSISTANT, "content": msg.content}
+        return _finish({"role": Constants.ROLE_ASSISTANT, "content": msg.content})
 
     for block in msg.content:
-        if block.type == Constants.CONTENT_TEXT:
+        block_type = getattr(block, "type", None)
+        if block_type == Constants.CONTENT_TEXT:
             text_parts.append(block.text)
-        elif block.type == Constants.CONTENT_TOOL_USE:
+        elif block_type == Constants.CONTENT_TOOL_USE:
             tool_calls.append(
                 {
                     "id": block.id,
@@ -242,6 +309,10 @@ def convert_claude_assistant_message(msg: ClaudeMessage) -> Dict[str, Any]:
                     },
                 }
             )
+        elif block_type == Constants.CONTENT_THINKING and include_reasoning:
+            reasoning = getattr(block, "thinking", "") or ""
+            if reasoning:
+                reasoning_parts.append(str(reasoning))
 
     openai_message = {"role": Constants.ROLE_ASSISTANT}
 
@@ -255,7 +326,7 @@ def convert_claude_assistant_message(msg: ClaudeMessage) -> Dict[str, Any]:
     if tool_calls:
         openai_message["tool_calls"] = tool_calls
 
-    return openai_message
+    return _finish(openai_message)
 
 
 def convert_claude_tool_results(msg: ClaudeMessage) -> List[Dict[str, Any]]:

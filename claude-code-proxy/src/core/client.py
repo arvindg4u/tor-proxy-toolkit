@@ -7,6 +7,7 @@ from typing import Optional, AsyncGenerator, Dict, Any
 from openai import AsyncOpenAI, AsyncAzureOpenAI
 from openai.types.chat import ChatCompletion, ChatCompletionChunk
 from openai._exceptions import APIError, RateLimitError, AuthenticationError, BadRequestError
+from src.core.failure_log import record_upstream_failure
 
 logger = logging.getLogger(__name__)
 
@@ -200,24 +201,31 @@ class OpenAIClient:
         
         except AuthenticationError as e:
             logger.error(f"chat upstream 401: {str(e)[:220]}")
+            self._record_failure(401, e, request, request_id)
             raise HTTPException(status_code=401, detail=self.classify_openai_error(str(e)))
         except RateLimitError as e:
             logger.error(f"chat upstream 429: {str(e)[:220]}")
             _rate_guard_trip()
+            self._record_failure(429, e, request, request_id)
             raise HTTPException(status_code=429, detail=self.classify_openai_error(str(e)))
         except BadRequestError as e:
             logger.error(f"chat upstream 400: {str(e)[:220]}")
+            self._record_failure(400, e, request, request_id)
             raise HTTPException(status_code=400, detail=self.classify_openai_error(str(e)))
         except APIError as e:
-            status_code = getattr(e, 'status_code', 500)
+            status_code = getattr(e, 'status_code', 500) or 500
             logger.error(f"chat upstream {status_code}: {str(e)[:220]}")
             if not _rotate_retried and await _recover_ip_abuse_403(e):
                 # Fresh peer confirmed: one transparent retry through the
                 # same call path (recursion depth capped by the flag).
                 return await self.create_chat_completion(request, request_id, _rotate_retried=True)
+            self._record_failure(status_code, e, request, request_id)
             raise HTTPException(status_code=status_code, detail=self.classify_openai_error(str(e)))
+        except HTTPException:
+            raise
         except Exception as e:
             logger.error(f"chat upstream unexpected: {str(e)[:220]}")
+            self._record_failure(500, e, request, request_id)
             raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
         
         finally:
@@ -275,26 +283,49 @@ class OpenAIClient:
                 
         except AuthenticationError as e:
             logger.error(f"chat stream 401: {str(e)[:220]}")
+            self._record_failure(401, e, request, request_id)
             raise HTTPException(status_code=401, detail=self.classify_openai_error(str(e)))
         except RateLimitError as e:
             logger.error(f"chat stream 429: {str(e)[:220]}")
             _rate_guard_trip()
+            self._record_failure(429, e, request, request_id)
             raise HTTPException(status_code=429, detail=self.classify_openai_error(str(e)))
         except BadRequestError as e:
             logger.error(f"chat stream 400: {str(e)[:220]}")
+            self._record_failure(400, e, request, request_id)
             raise HTTPException(status_code=400, detail=self.classify_openai_error(str(e)))
         except APIError as e:
-            status_code = getattr(e, 'status_code', 500)
+            status_code = getattr(e, 'status_code', 500) or 500
             logger.error(f"chat stream {status_code}: {str(e)[:220]}")
+            self._record_failure(status_code, e, request, request_id)
             raise HTTPException(status_code=status_code, detail=self.classify_openai_error(str(e)))
+        except HTTPException:
+            raise
         except Exception as e:
             logger.error(f"chat stream unexpected: {str(e)[:220]}")
+            self._record_failure(500, e, request, request_id)
             raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
         
         finally:
             # Clean up active request tracking
             if request_id and request_id in self.active_requests:
                 del self.active_requests[request_id]
+
+    @staticmethod
+    def _record_failure(
+        status: int, error: Exception, request: Dict[str, Any], request_id: Optional[str]
+    ) -> None:
+        """Persist a final upstream failure for the status dashboard."""
+        try:
+            record_upstream_failure(
+                status,
+                str(error),
+                model=request.get("model") if isinstance(request, dict) else None,
+                request_id=request_id,
+            )
+        except Exception:
+            # Dashboard diagnostics must never replace the real API error.
+            pass
 
     def classify_openai_error(self, error_detail: Any) -> str:
         """Provide specific error guidance for common OpenAI API issues."""

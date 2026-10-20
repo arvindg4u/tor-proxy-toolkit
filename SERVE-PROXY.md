@@ -4,6 +4,7 @@ Lab-verified on 2026-10-18 (`arm-free-1`, Mumbai). Working base URL:
 
 ```
 https://rvndha.duckdns.org:4014/v1        (also works bare, without /v1)
+https://rvndha.duckdns.org:18081/         (read-only status dashboard, basic auth)
 ```
 
 ---
@@ -28,7 +29,8 @@ Stack controls:
 - `~/wgtunnel/wireproxy/resolve-proxy.sh` — local CONNECT resolver on `127.0.0.1:18105`: resolves hostnames on the **host**, then hands wireproxy an IP literal, so the in-tunnel resolver is never used for API traffic
 - `~/wgtunnel/wireproxy/auto.sh` — rotates peers on 429 / dead probes (`auto.log`)
 - `~/bin/gatewatch` — 3-token heartbeat every 5 min → `/tmp/opencode/gatewatch.log`
-- `wgtunnel dash` on `:18080` — dashboard + manual Rotate button
+- `wgtunnel dash` on `:18080` — tunnel dashboard + manual Rotate button
+- `claude-dashboard-ipv6` vhost on `:18081` — read-only Claude Zen status dashboard (basic auth, only `/` and `/api/status` proxied; `/v1/*` stays on `:4014`)
 
 ## 2. nginx vhost (`/etc/nginx/sites-enabled/claude-proxy-ipv6`)
 
@@ -66,11 +68,19 @@ from a URL that includes credentials") — that's why the header-key door exists
   `ANTHROPIC_API_KEY` (`sk-local-claude-code`) — enforced twice (nginx map +
   proxy constant-time compare). `satisfy any` lets either through.
 
+**Dashboard** (`/etc/nginx/sites-enabled/claude-dashboard-ipv6`): dedicated
+`:18081` TLS vhost, basic auth only, both address families. It exposes exactly
+`GET/HEAD /` and `GET/HEAD /api/status`; every other path returns 404. The
+dashboard shows live request/error/token stats, the egress path, configuration,
+the last final upstream failure, archived failure history, and copy-ready client
+setup. `PUBLIC_BASE_URL` (optional, in `claude-code-proxy/.env`) controls the
+displayed API origin.
+
 ## 3. Cloud + host firewall (the two-layer Oracle trap)
 
 **Layer A — OCI Security List** (`Default Security List for hermes-vcn`):
-TCP ingress opened per-port, **both families**. As of 2026-10-18:
-22, 80, 8124, 443, 18080, 18789, **4014** (`::/0` + `0.0.0.0/0`).
+TCP ingress opened per-port, **both families**. As of 2026-10-20:
+22, 80, 8124, 443, 18080, **18081**, 18789, **4014** (`::/0` + `0.0.0.0/0`).
 Add more with the CLI pattern:
 
 ```bash

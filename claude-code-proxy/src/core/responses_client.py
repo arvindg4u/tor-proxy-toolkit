@@ -9,7 +9,7 @@ import httpx
 from fastapi import HTTPException
 
 from src.core.config import config
-from src.core.guards import scrub_api_keys
+from src.core.failure_log import record_upstream_failure
 from src.core.http_client import get_shared_client, get_stream_timeout
 
 logger = logging.getLogger(__name__)
@@ -160,31 +160,17 @@ class ResponsesClient:
 
         Stores the upstream error text + timestamp first; only a truncated
         payload summary (never the full prompt) so the dashboard shows the
-        actual error instead of a wall of request text.
+        actual error instead of a wall of request text. The previous record
+        is archived by :mod:`src.core.failure_log`.
         """
-        import os
-        import time as _time
-
-        try:
-            log_dir = os.environ.get("PROXY_LOG_DIR", "logs")
-            os.makedirs(log_dir, exist_ok=True)
-            path = os.path.join(log_dir, "last_upstream_failure.json")
-            with open(path, "w") as f:
-                json.dump(
-                    {
-                        "status": status,
-                        "error": scrub_api_keys(error or "")[:2000],
-                        "model": model,
-                        "request_id": request_id,
-                        "cache_ttl": ttl,
-                        "shape": ResponsesClient._payload_shape(payload),
-                        "at": _time.time(),
-                    },
-                    f,
-                    ensure_ascii=False,
-                )
-        except Exception:
-            pass
+        record_upstream_failure(
+            status,
+            error or "",
+            model=model,
+            request_id=request_id,
+            ttl=ttl,
+            shape=ResponsesClient._payload_shape(payload),
+        )
 
     @staticmethod
     def _retryable(exc: HTTPException) -> bool:

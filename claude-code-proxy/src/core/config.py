@@ -32,6 +32,9 @@ class Config:
         self.azure_api_version = os.environ.get("AZURE_API_VERSION")  # For Azure OpenAI
         self.host = os.environ.get("HOST", "0.0.0.0")
         self.port = int(os.environ.get("PORT", "8082"))
+        # Optional customer-facing API origin shown on the dashboard. When
+        # empty the UI derives it from the browser origin + proxy port.
+        self.public_base_url = os.environ.get("PUBLIC_BASE_URL", "").strip().rstrip("/")
         self.log_level = os.environ.get("LOG_LEVEL", "INFO")
         self.max_tokens_limit = int(os.environ.get("MAX_TOKENS_LIMIT", "4096"))
         self.min_tokens_limit = int(os.environ.get("MIN_TOKENS_LIMIT", "100"))

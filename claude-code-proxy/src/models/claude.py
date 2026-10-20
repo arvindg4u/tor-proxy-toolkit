@@ -31,8 +31,8 @@ class ClaudeContentBlockToolResult(BaseModel):
 
 class ClaudeContentBlockThinking(BaseModel):
     """Thinking block echoed back in history (incl. proxy-emitted ones,
-    which carry an empty signature). Accepted so history replay validates;
-    converters intentionally drop thinking on the upstream path."""
+    which carry an empty signature). The chat converter replays the text as
+    upstream ``reasoning_content`` when the upstream needs reasoning replay."""
     type: Literal["thinking"]
     thinking: str = ""
     signature: Optional[str] = None

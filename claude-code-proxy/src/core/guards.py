@@ -3,11 +3,13 @@
 import re
 from typing import Mapping
 
-_API_KEY_RE = re.compile(r"sk-[A-Za-z0-9\-_]{3,}")
+# Covers the local `sk-...` key, the upstream `oc_sk_...` key, and the
+# underscore form some OpenAI-compatible providers use.
+_API_KEY_RE = re.compile(r"(?<![A-Za-z0-9])(?:oc_)?sk[-_][A-Za-z0-9\-_]{3,}")
 
 
 def scrub_api_keys(text: str) -> str:
-    """Replace key-like `sk-...` fragments so logs/status never leak them."""
+    """Replace key-like `sk-...` / `oc_sk_...` fragments so logs never leak."""
     if not text:
         return ""
     return _API_KEY_RE.sub("sk-***", str(text))

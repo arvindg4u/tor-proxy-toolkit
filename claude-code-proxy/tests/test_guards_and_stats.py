@@ -5,14 +5,17 @@ Runs under pytest when available, and also as a plain script:
 (no third-party test deps required).
 """
 
+import json
 import math
 import os
 import sys
+import tempfile
 
 os.environ.setdefault("OPENAI_API_KEY", "sk-test-dummy")
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from src.core.failure_log import record_upstream_failure  # noqa: E402
 from src.core.guards import (  # noqa: E402
     body_too_large,
     sanitize_passthrough_path,
@@ -26,6 +29,9 @@ def test_scrub_api_keys():
     assert scrub_api_keys("no keys here") == "no keys here"
     assert scrub_api_keys("") == ""
     assert scrub_api_keys(None) == ""
+    # Upstream OpenCode key and underscore form must not leak either.
+    assert "TESTONLY" not in scrub_api_keys("upstream oc_sk_TESTONLY123456_secret")
+    assert scrub_api_keys("upstream oc_sk_TESTONLY123456_secret") == "upstream sk-***"
     # Upstream-masked fragments still scrubbed.
     assert "sk-" not in scrub_api_keys("err sk-test-*ummy end").replace("sk-***", "")
 
@@ -71,7 +77,10 @@ def test_record_stream_error():
     snap = s.snapshot()
     assert snap["total_requests"] == total, "stream errors must not double-count"
     assert snap["errors"] == 1
+    assert snap["stream_errors"] == 1
+    assert snap["ok_requests"] == 0, "the optimistic 200 must become the error"
     assert snap["by_status"].get("429") == 1
+    assert "200" not in snap["by_status"], "by_status must reflect final outcomes"
     assert snap["last_error_at"] is not None
 
 
@@ -107,6 +116,36 @@ def test_by_model_cardinality_cap():
     assert len(s.snapshot()["by_model"]) <= 200
 
 
+def test_failure_log_archives_and_scrubs():
+    previous = os.environ.get("PROXY_LOG_DIR")
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["PROXY_LOG_DIR"] = tmp
+            record_upstream_failure(
+                429, "quota for sk-abcDEF123_xyz", model="m1", request_id="r1"
+            )
+            record_upstream_failure(500, "boom", model="m2", request_id="r2")
+            last_path = os.path.join(tmp, "last_upstream_failure.json")
+            with open(last_path, encoding="utf-8") as fh:
+                last = json.load(fh)
+            assert last["status"] == 500
+            assert last["error"] == "boom"
+            history = os.listdir(os.path.join(tmp, "failures"))
+            assert len(history) == 1, history
+            with open(
+                os.path.join(tmp, "failures", history[0]), encoding="utf-8"
+            ) as fh:
+                archived = json.load(fh)
+            assert archived["status"] == 429
+            assert "abcDEF" not in archived["error"]
+            assert "sk-***" in archived["error"]
+    finally:
+        if previous is None:
+            os.environ.pop("PROXY_LOG_DIR", None)
+        else:
+            os.environ["PROXY_LOG_DIR"] = previous
+
+
 _TESTS = [
     test_scrub_api_keys,
     test_sanitize_passthrough_path,
@@ -114,6 +153,7 @@ _TESTS = [
     test_record_stream_error,
     test_stat_input_guards,
     test_by_model_cardinality_cap,
+    test_failure_log_archives_and_scrubs,
 ]
 
 
