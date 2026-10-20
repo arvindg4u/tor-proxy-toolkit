@@ -47,9 +47,21 @@ do_start() {
             echo "    (fail-closed: refusing direct upstream so nothing leaks)"
             return 1
         fi
-        export HTTP_PROXY="http://127.0.0.1:$_wg_port" HTTPS_PROXY="http://127.0.0.1:$_wg_port"
+        # Proton's in-tunnel resolver (10.2.0.1) stops answering ~58 min into
+        # every WireGuard session while the tunnel itself keeps working. Keep
+        # hostnames off it: resolve on the host (resolve-proxy.sh, :18105) and
+        # hand wireproxy only IP literals. The helper uses the stable tunnel
+        # port, so it survives peer rotations.
+        _up_port="$_wg_port"
+        if [ -x "$_wg_state/resolve-proxy.sh" ] \
+           && "$_wg_state/resolve-proxy.sh" start >/dev/null 2>&1; then
+            _up_port=18105
+            _transport="via local resolver 127.0.0.1:18105 -> tunnel 127.0.0.1:$_wg_port"
+        else
+            _transport="via tunnel 127.0.0.1:$_wg_port"
+        fi
+        export HTTP_PROXY="http://127.0.0.1:$_up_port" HTTPS_PROXY="http://127.0.0.1:$_up_port"
         export http_proxy="$HTTP_PROXY" https_proxy="$HTTPS_PROXY"
-        _transport="via tunnel 127.0.0.1:$_wg_port"
     else
         echo "[i] No wgtunnel component installed — upstream goes direct"
         _transport="direct"

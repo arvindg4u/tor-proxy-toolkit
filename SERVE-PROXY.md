@@ -25,6 +25,7 @@ Internet ──TLS:4014── nginx [v6 2603:…:75e1 | v4 0.0.0.0]
 
 Stack controls:
 - `~/tor-proxy-toolkit/claude-zen` — start/stop/restart zen (refuses without a live tunnel)
+- `~/wgtunnel/wireproxy/resolve-proxy.sh` — local CONNECT resolver on `127.0.0.1:18105`: resolves hostnames on the **host**, then hands wireproxy an IP literal, so the in-tunnel resolver is never used for API traffic
 - `~/wgtunnel/wireproxy/auto.sh` — rotates peers on 429 / dead probes (`auto.log`)
 - `~/bin/gatewatch` — 3-token heartbeat every 5 min → `/tmp/opencode/gatewatch.log`
 - `wgtunnel dash` on `:18080` — dashboard + manual Rotate button
@@ -211,7 +212,7 @@ curl -o /dev/null -w '%{http_code}\n' https://rvndha.duckdns.org:4014/v1/models
 | `429 FreeUsageLimitError` | free-tier rate window burned | wait it out (pattern: self-lifts); `gatewatch` heartbeat; Rotate peer if IP-scoped |
 | `403 FreeTierError` "abusive traffic from this IP" | **IP-scoped** abuse flag on the shared Proton relay | auto.sh rotates on it (10s scan); the proxy waits for the new `live:` line and retries once — you may never see this one |
 | tunnel "fully dark" bursts | Proton free peer death mode | auto.sh rotates on its own; check `auto.log` |
-| every ~58 min: `lookup … on 10.2.0.1: i/o timeout`, yet keepalives continue | Proton free **session cliff** — the in-tunnel resolver stops answering 55–59 min after a peer starts; every hostname-based request dies with it | fixed proactively: `auto.sh` rotates at **50 min** (`WG_ROTATE_INTERVAL`, default 3000 s), timed from the live peer's launch, so the cliff is never reached |
+| every ~58 min: `lookup … on 10.2.0.1: i/o timeout`, yet keepalives continue | Proton free **session cliff** — the in-tunnel resolver stops answering 55–59 min after a peer starts; every hostname-based request dies with it | fixed at the root: the zen proxy uses `resolve-proxy.sh` (`:18105`), which resolves on the host and tunnels by **IP**, so the dead in-tunnel resolver is irrelevant; peers stay until a real failure. Optional safety timer: `WG_ROTATE_INTERVAL` (default **0**, off) |
 
 ## 9. Secrets & hygiene
 
