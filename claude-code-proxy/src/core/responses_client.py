@@ -209,6 +209,9 @@ class ResponsesClient:
                     )
                     if resp.status_code >= 400:
                         err_text = resp.text
+                        logger.error(
+                            f"responses upstream {resp.status_code}: {err_text[:220]}"
+                        )
                         self._dump_failure(
                             resp.status_code,
                             err_text,
@@ -246,6 +249,7 @@ class ResponsesClient:
                     # Upstream HTTP 200 carrying a rate-limit error body
                     # (e.g. FreeUsageLimitError): signal it like an HTTP 429
                     # so the failure watcher rotates the egress peer.
+                    logger.error(f"responses upstream 429: {err_text[:220]}")
                     self._dump_failure(
                         429, err_text, model=payload.get("model"), request_id=request_id,
                         payload=payload,
@@ -306,6 +310,9 @@ class ResponsesClient:
                             if resp.status_code >= 400:
                                 err_body = await resp.aread()
                                 err_text = err_body.decode("utf-8", "replace")
+                                logger.error(
+                                    f"responses stream upstream {resp.status_code}: {err_text[:220]}"
+                                )
                                 self._dump_failure(
                                     resp.status_code,
                                     err_text,

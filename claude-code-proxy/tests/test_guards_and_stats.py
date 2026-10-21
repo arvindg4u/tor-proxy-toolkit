@@ -16,6 +16,7 @@ os.environ.setdefault("OPENAI_API_KEY", "sk-test-dummy")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.core.failure_log import record_upstream_failure  # noqa: E402
+from src.core.client import _is_key_scoped_429  # noqa: E402
 from src.core.guards import (  # noqa: E402
     body_too_large,
     sanitize_passthrough_path,
@@ -116,6 +117,19 @@ def test_by_model_cardinality_cap():
     assert len(s.snapshot()["by_model"]) <= 200
 
 
+def test_429_classification():
+    assert _is_key_scoped_429(
+        "Error code: 429 - {'type': 'error', 'error': "
+        "{'type': 'FreeUsageLimitError', 'message': 'Rate limit exceeded.'}}"
+    )
+    assert _is_key_scoped_429("429 rate_limit_exceeded")
+    assert not _is_key_scoped_429(
+        "Error code: 429 - {'type': 'server_error', 'message': "
+        "'Upstream request failed: Endpoint is unavailable.'}"
+    )
+    assert not _is_key_scoped_429("429 Too Many Requests")
+
+
 def test_failure_log_archives_and_scrubs():
     previous = os.environ.get("PROXY_LOG_DIR")
     try:
@@ -153,6 +167,7 @@ _TESTS = [
     test_record_stream_error,
     test_stat_input_guards,
     test_by_model_cardinality_cap,
+    test_429_classification,
     test_failure_log_archives_and_scrubs,
 ]
 

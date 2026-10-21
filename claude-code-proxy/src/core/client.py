@@ -26,6 +26,23 @@ _RATE_GUARD_BASE = 10.0
 _RATE_GUARD_MAX = 60.0
 
 
+def _is_key_scoped_429(error: str) -> bool:
+    """True for the free-tier key window (rotation cannot clear it).
+
+    OpenCode also returns HTTP 429 for a transient ``Endpoint is
+    unavailable`` gate error. That one is peer-scoped and *is* worth
+    rotating for, so it must not trip the key-window circuit breaker.
+    """
+    low = error.lower()
+    return (
+        "freeusagelimiterror" in low
+        or "rate limit exceeded" in low
+        or "rate_limit_exceeded" in low
+        or "rate_limit_error" in low
+        or "quota" in low
+    )
+
+
 def _rate_guard_remaining() -> float:
     return max(0.0, _RATE_GUARD_UNTIL - time.monotonic())
 
@@ -65,7 +82,7 @@ def _rate_guard_check() -> None:
 # FreeTierError ("detected abusive traffic from this IP address"). The flag
 # is IP-scoped (verified live: same key/session/headers pass on a different
 # peer), so the cure is a fresh peer — and auto.sh already rotates on this
-# exact error (its scan runs every WG_POLL=10s and owns rotation). Rather
+# exact error (its scan runs every WG_POLL=1s and owns rotation). Rather
 # than a proxy-side rotation colliding with auto.sh's, we wait for auto.sh's
 # rotation to complete (new "live:" line in auto.log) and retry once.
 _WIREPROXY_DIR = os.environ.get("WIREPROXY_DIR", "/home/ubuntu/wgtunnel/wireproxy")
@@ -204,10 +221,21 @@ class OpenAIClient:
             self._record_failure(401, e, request, request_id)
             raise HTTPException(status_code=401, detail=self.classify_openai_error(str(e)))
         except RateLimitError as e:
-            logger.error(f"chat upstream 429: {str(e)[:220]}")
-            _rate_guard_trip()
+            err = str(e)
+            logger.error(f"chat upstream 429: {err[:220]}")
+            if _is_key_scoped_429(err):
+                _rate_guard_trip()
+            elif not _rotate_retried:
+                logger.warning(
+                    "upstream 429 is not key-scoped; waiting for auto.sh "
+                    "rotation before one retry"
+                )
+                if await _await_peer_rotation(max_wait=30.0):
+                    return await self.create_chat_completion(
+                        request, request_id, _rotate_retried=True
+                    )
             self._record_failure(429, e, request, request_id)
-            raise HTTPException(status_code=429, detail=self.classify_openai_error(str(e)))
+            raise HTTPException(status_code=429, detail=self.classify_openai_error(err))
         except BadRequestError as e:
             logger.error(f"chat upstream 400: {str(e)[:220]}")
             self._record_failure(400, e, request, request_id)
@@ -264,6 +292,20 @@ class OpenAIClient:
             except APIError as e:
                 if not _rotate_retried and await _recover_ip_abuse_403(e):
                     streaming_completion = await self.client.chat.completions.create(**request)
+                elif (
+                    not _rotate_retried
+                    and getattr(e, "status_code", None) == 429
+                    and not _is_key_scoped_429(str(e))
+                ):
+                    # Log first: auto.sh watches this line and owns rotation.
+                    logger.error(f"chat stream 429: {str(e)[:220]}")
+                    logger.warning(
+                        "transient 429; waiting for auto.sh rotation before one retry"
+                    )
+                    if await _await_peer_rotation(max_wait=30.0):
+                        streaming_completion = await self.client.chat.completions.create(**request)
+                    else:
+                        raise
                 else:
                     raise
             
@@ -286,10 +328,12 @@ class OpenAIClient:
             self._record_failure(401, e, request, request_id)
             raise HTTPException(status_code=401, detail=self.classify_openai_error(str(e)))
         except RateLimitError as e:
-            logger.error(f"chat stream 429: {str(e)[:220]}")
-            _rate_guard_trip()
+            err = str(e)
+            logger.error(f"chat stream 429: {err[:220]}")
+            if _is_key_scoped_429(err):
+                _rate_guard_trip()
             self._record_failure(429, e, request, request_id)
-            raise HTTPException(status_code=429, detail=self.classify_openai_error(str(e)))
+            raise HTTPException(status_code=429, detail=self.classify_openai_error(err))
         except BadRequestError as e:
             logger.error(f"chat stream 400: {str(e)[:220]}")
             self._record_failure(400, e, request, request_id)

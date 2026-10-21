@@ -137,11 +137,14 @@ OpenCode's ZEN gate demands agent-CLI identity on the *chat* wire:
 6. **IP-abuse 403 recovery** (the *"detected abusive traffic from this IP"*
    variant): this flag is **IP-scoped** (verified: identical key/session/
    headers pass on a different peer minutes later). auto.sh owns rotation —
-   its zen-log scan (every 10s) catches the 403 and rotates; `client.py`
+   its 1s log scan catches the 403 and every real 429; `client.py`
    then waits for a **new `live:` line in `auto.log`** (≤60s) and transparently
    retries the upstream attempt exactly once, on both streaming and
    non-streaming paths (pre-yield, so nothing is duplicated). If no rotation
-   completes in 60s the original error surfaces unchanged.
+   completes in 60s the original error surfaces unchanged. Transient
+   `429 ... Endpoint is unavailable` responses use the same wait-and-retry
+   path (≤30s); a key-scoped `FreeUsageLimitError` trips the local hold
+   instead, because a fresh peer cannot clear that window.
 
 ## 6. Endpoints (all key-gated)
 
@@ -196,7 +199,8 @@ Which platforms can be pointed at this proxy. "OpenAI" = `POST /v1/chat/completi
 - **Cursor/Windsurf** are the only real "no": the override is global, not per-model.
 - **Free-tier rate window** — `FreeUsageLimitError` 429s appear under bursty parallel
   load (it killed two background research agents during this session). Serial use is
-  fine; wait it out or rotate the Proton peer via `auto.log`.
+  fine; auto.sh rotates on every observed 429 (1s scan), but a key-scoped window only
+  clears with time; the proxy holds retries locally while it refills.
 
 ## 7. Verification matrix (curl)
 
@@ -219,8 +223,9 @@ curl -o /dev/null -w '%{http_code}\n' https://rvndha.duckdns.org:4014/v1/models
 | timeout, "didn't respond in time" (n8n) | OCI SL missing the port **or** host INPUT REJECT **or** container→host hairpin | SL rule + remove REJECT + `extra_hosts` pin (§3, §4) |
 | `Request cannot be constructed… credentials` | `user:pass@` in a browser fetch | use the API-key field (header door already open) |
 | `FreeTierError` on `/chat/completions` while `/v1/messages` passes | missing CLI manifest (streaming branch!) or stale proxy | this commit; `claude-zen restart` |
-| `429 FreeUsageLimitError` | free-tier rate window burned | wait it out (pattern: self-lifts); `gatewatch` heartbeat; Rotate peer if IP-scoped |
-| `403 FreeTierError` "abusive traffic from this IP" | **IP-scoped** abuse flag on the shared Proton relay | auto.sh rotates on it (10s scan); the proxy waits for the new `live:` line and retries once — you may never see this one |
+| `429 FreeUsageLimitError` | free-tier rate window burned | wait it out (pattern: self-lifts); `gatewatch` heartbeat; auto.sh rotates on the 429 (1s scan) but a key-scoped window may outlast the peer |
+| `429 ... Endpoint is unavailable` | transient OpenCode gate error carried as HTTP 429 | auto.sh rotates on the 429 (1s scan); the proxy waits for the new `live:` line and retries once (≤30s) |
+| `403 FreeTierError` "abusive traffic from this IP" | **IP-scoped** abuse flag on the shared Proton relay | auto.sh rotates on it (1s scan); the proxy waits for the new `live:` line and retries once — you may never see this one |
 | tunnel "fully dark" bursts | Proton free peer death mode | auto.sh rotates on its own; check `auto.log` |
 | every ~58 min: `lookup … on 10.2.0.1: i/o timeout`, yet keepalives continue | Proton free **session cliff** — the in-tunnel resolver stops answering 55–59 min after a peer starts; every hostname-based request dies with it | fixed at the root: the zen proxy uses `resolve-proxy.sh` (`:18105`), which resolves on the host and tunnels by **IP**, so the dead in-tunnel resolver is irrelevant; peers stay until a real failure. Optional safety timer: `WG_ROTATE_INTERVAL` (default **0**, off) |
 
