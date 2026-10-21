@@ -28,6 +28,11 @@ from src.conversion.response_responses import (
     convert_responses_streaming_to_claude_with_cancellation,
 )
 from src.core.model_manager import model_manager
+from src.core.retry import (
+    TransientUpstreamError,
+    find_sse_error_text,
+    find_transient_payload,
+)
 
 router = APIRouter()
 
@@ -375,6 +380,7 @@ async def _collect_streamed_chat_response(
             if kind == "done":
                 break
             if kind != "chunk" or not chunk:
+                # "ping" (keepalive tick) and "ignore" carry no payload.
                 continue
             if chunk.get("id"):
                 response_id = chunk["id"]
@@ -568,15 +574,8 @@ async def passthrough_responses(
         )
     else:
         try:
-            client = await get_shared_client()
-            resp = await client.post(
-                url, content=body, headers=headers, params=params,
-                timeout=config.request_timeout,
-            )
-            stats.record(
-                "/v1/responses",
-                status=resp.status_code,
-                model=payload.get("model") if isinstance(payload, dict) else None,
+            resp = await _post_upstream_with_retry(
+                url, body, headers, params, "/v1/responses", payload
             )
             try:
                 data = resp.json()
@@ -599,61 +598,243 @@ async def passthrough_responses(
             )
 
 
+async def _post_upstream_with_retry(url, body, headers, params, endpoint, payload):
+    """POST to the upstream, retrying transient failures in place.
+
+    The free tier's models flap: the upstream answers with "Model is
+    temporarily unavailable upstream", a bare 5xx, or a rate-limit rejection
+    that clears on its own within seconds. Those are retried here on a
+    fixed interval (10 attempts, 10s apart) instead of being forwarded to
+    the client as an error — the client cannot retry them, the proxy can.
+
+    A permanent failure (400/401/403) is returned to the caller as-is.
+    """
+    attempt = 0
+    while True:
+        client = await get_shared_client()
+        try:
+            resp = await client.post(
+                url, content=body, headers=headers, params=params,
+                timeout=config.request_timeout,
+            )
+        except Exception as e:
+            # A connection-level failure (tunnel hiccup, dropped socket) is
+            # transient: treat it like a 5xx and try again.
+            attempt += 1
+            if not config.retry_policy.should_retry(attempt, e):
+                raise
+            logger.error(f"Passthrough {endpoint} transient: {str(e)[:220]}")
+            logger.warning(
+                "transient upstream failure, retrying in %ds (attempt %d/%d)",
+                int(config.retry_policy.interval),
+                attempt + 1,
+                config.retry_policy.attempts,
+            )
+            await config.retry_policy.sleep()
+            continue
+
+        # The upstream can answer HTTP 200 and still carry an error body
+        # (the free tier's rate-limit rejection arrives that way), so the
+        # body is inspected even on a success status.
+        try:
+            data = resp.json()
+        except Exception:
+            data = None
+        error_text = find_transient_payload(data)
+        if error_text is None and resp.status_code >= 400:
+            error_text = resp.text
+        if error_text is not None:
+            attempt += 1
+            transient = TransientUpstreamError(error_text, resp.status_code)
+            if not config.retry_policy.should_retry(attempt, transient):
+                stats.record(
+                    endpoint,
+                    status=resp.status_code,
+                    model=payload.get("model") if isinstance(payload, dict) else None,
+                )
+                return resp
+            logger.error(
+                f"Passthrough {endpoint} upstream {resp.status_code}: {error_text[:220]}"
+            )
+            logger.warning(
+                "transient upstream failure, retrying in %ds (attempt %d/%d)",
+                int(config.retry_policy.interval),
+                attempt + 1,
+                config.retry_policy.attempts,
+            )
+            await config.retry_policy.sleep()
+            continue
+
+        stats.record(
+            endpoint,
+            status=resp.status_code,
+            model=payload.get("model") if isinstance(payload, dict) else None,
+        )
+        return resp
+        logger.error(
+            f"Passthrough {endpoint} upstream {resp.status_code}: {error_text[:220]}"
+        )
+        logger.warning(
+            "transient upstream failure, retrying in %ds (attempt %d/%d)",
+            int(config.retry_policy.interval),
+            attempt + 1,
+            config.retry_policy.attempts,
+        )
+        await config.retry_policy.sleep()
+
+
+async def _retry_wait_pings():
+    """Sleep out the retry interval, emitting SSE pings while waiting.
+
+    A retry can wait 10s or more. The client is watching for bytes, so
+    keepalives go out during the wait to stop it from timing out.
+    """
+    remaining = config.retry_policy.interval
+    while remaining > 0:
+        step = min(5.0, remaining)
+        await asyncio.sleep(step)
+        remaining -= step
+        if remaining > 0:
+            stats.record_keepalive()
+            yield b": ping\n\n"
+
+
 async def _passthrough_stream_gen(request, url, body, headers, params):
     """Forward an upstream SSE stream with keepalive + disconnect hygiene.
 
     Errors (including upstream rejections) become a best-effort
     ``data: {"error": ...}`` frame — headers are already committed — plus
     stats; raw upstream bodies are never forwarded verbatim.
-    """
-    import json as _json
 
+    Transient upstream failures are retried in place. Nothing is forwarded
+    to the client until the first upstream event is known to be good, so a
+    flapping free-tier model ("Model is temporarily unavailable upstream",
+    a rate-limit rejection, a dropped connection) is retried instead of
+    ending the client's turn with an error.
+    """
     stats.record_stream()
     keepalive = config.stream_keepalive_secs if config.stream_keepalive_secs > 0 else 15.0
-    pending = None
-    try:
-        client = await get_shared_client()
-        async with client.stream(
-            "POST", url, content=body, headers=headers, params=params,
-            timeout=get_stream_timeout(),
-        ) as resp:
-            if resp.status_code >= 400:
-                err_body = await resp.aread()
-                stats.record_stream_error(resp.status_code)
-                yield _passthrough_error_frame(err_body.decode("utf-8", "replace"))
-                return
-            it = resp.aiter_bytes()
-            while True:
-                if pending is None:
-                    pending = asyncio.create_task(it.__anext__())
-                try:
-                    # Shield the read: a keepalive timeout must not cancel
-                    # the in-flight chunk (the same task is re-awaited).
-                    chunk = await asyncio.wait_for(asyncio.shield(pending), timeout=keepalive)
-                except StopAsyncIteration:
+    attempt = 0
+    while True:
+        pending = None
+        buffered = b""
+        forwarded = False
+        try:
+            client = await get_shared_client()
+            async with client.stream(
+                "POST", url, content=body, headers=headers, params=params,
+                timeout=get_stream_timeout(),
+            ) as resp:
+                if resp.status_code >= 400:
+                    err_body = await resp.aread()
+                    err_text = err_body.decode("utf-8", "replace")
+                    attempt += 1
+                    transient = TransientUpstreamError(err_text, resp.status_code)
+                    if config.retry_policy.should_retry(attempt, transient):
+                        logger.error(
+                            f"Passthrough stream upstream {resp.status_code}: {err_text[:220]}"
+                        )
+                        logger.warning(
+                            "transient upstream failure, retrying in %ds (attempt %d/%d)",
+                            int(config.retry_policy.interval),
+                            attempt + 1,
+                            config.retry_policy.attempts,
+                        )
+                        async for tick in _retry_wait_pings():
+                            yield tick
+                        continue
+                    stats.record_stream_error(resp.status_code)
+                    yield _passthrough_error_frame(err_text)
+                    return
+                it = resp.aiter_bytes()
+                retry_requested = False
+                while True:
+                    if pending is None:
+                        pending = asyncio.create_task(it.__anext__())
+                    try:
+                        # Shield the read: a keepalive timeout must not cancel
+                        # the in-flight chunk (the same task is re-awaited).
+                        chunk = await asyncio.wait_for(asyncio.shield(pending), timeout=keepalive)
+                    except StopAsyncIteration:
+                        pending = None
+                        if buffered and not forwarded:
+                            # The stream ended with a trailing partial event
+                            # (no blank-line boundary). It is not an error
+                            # event, so forward it rather than dropping it.
+                            forwarded = True
+                            yield buffered
+                            buffered = b""
+                        break
+                    except asyncio.TimeoutError:
+                        if await request.is_disconnected():
+                            break
+                        stats.record_keepalive()
+                        yield b": ping\n\n"
+                        continue
                     pending = None
-                    break
-                except asyncio.TimeoutError:
+                    if chunk:
+                        if not forwarded:
+                            # Hold the first event back until it is known to
+                            # be good: an upstream that answers 200 and then
+                            # delivers the rejection inside the stream must
+                            # be retried, not forwarded.
+                            buffered += chunk
+                            if b"\n\n" not in buffered:
+                                continue
+                            err_text = find_sse_error_text(buffered)
+                            if err_text is not None:
+                                attempt += 1
+                                transient = TransientUpstreamError(err_text, 200)
+                                if config.retry_policy.should_retry(attempt, transient):
+                                    logger.error(
+                                        f"Passthrough stream upstream error: {err_text[:220]}"
+                                    )
+                                    logger.warning(
+                                        "transient upstream failure, retrying in %ds (attempt %d/%d)",
+                                        int(config.retry_policy.interval),
+                                        attempt + 1,
+                                        config.retry_policy.attempts,
+                                    )
+                                    async for tick in _retry_wait_pings():
+                                        yield tick
+                                    retry_requested = True
+                                    break
+                            forwarded = True
+                            yield buffered
+                            buffered = b""
+                        else:
+                            yield chunk
                     if await request.is_disconnected():
                         break
-                    stats.record_keepalive()
-                    yield b": ping\n\n"
+                if retry_requested:
+                    # Nothing was forwarded downstream, so the upstream can
+                    # simply be tried again.
                     continue
-                pending = None
-                if chunk:
-                    yield chunk
-                if await request.is_disconnected():
-                    break
-    except HTTPException as e:
-        stats.record_stream_error(e.status_code or 500)
-        yield _passthrough_error_frame(str(e.detail))
-    except Exception as e:
-        logger.error(f"Passthrough stream failed: {e}")
-        stats.record_stream_error(502)
-        yield _passthrough_error_frame("Upstream unavailable, retry")
-    finally:
-        if pending is not None and not pending.done():
-            pending.cancel()
+                break
+        except HTTPException as e:
+            stats.record_stream_error(e.status_code or 500)
+            yield _passthrough_error_frame(str(e.detail))
+            return
+        except Exception as e:
+            attempt += 1
+            if not forwarded and config.retry_policy.should_retry(attempt, e):
+                logger.error(f"Passthrough stream transient: {str(e)[:220]}")
+                logger.warning(
+                    "transient upstream failure, retrying in %ds (attempt %d/%d)",
+                    int(config.retry_policy.interval),
+                    attempt + 1,
+                    config.retry_policy.attempts,
+                )
+                async for tick in _retry_wait_pings():
+                    yield tick
+                continue
+            logger.error(f"Passthrough stream failed: {e}")
+            stats.record_stream_error(502)
+            yield _passthrough_error_frame("Upstream unavailable, retry")
+            return
+        finally:
+            if pending is not None and not pending.done():
+                pending.cancel()
 
 
 def _passthrough_error_frame(detail: str) -> bytes:
@@ -790,15 +971,8 @@ async def passthrough_chat_completions(
                     usage=data.get("usage") if isinstance(data, dict) else None,
                 )
                 return JSONResponse(status_code=200, content=data)
-            client = await get_shared_client()
-            resp = await client.post(
-                url, content=body, headers=headers, params=params,
-                timeout=config.request_timeout,
-            )
-            stats.record(
-                "/v1/chat/completions",
-                status=resp.status_code,
-                model=payload.get("model") if isinstance(payload, dict) else None,
+            resp = await _post_upstream_with_retry(
+                url, body, headers, params, "/v1/chat/completions", payload
             )
             try:
                 data = resp.json()
@@ -962,6 +1136,8 @@ async def api_status():
                 "max_tokens_limit": config.max_tokens_limit,
                 "request_timeout": config.request_timeout,
                 "retry_budget_secs": config.responses_retry_budget_secs,
+                "retry_attempts": config.retry_attempts,
+                "retry_interval_secs": config.retry_interval_secs,
                 "keepalive_secs": config.stream_keepalive_secs,
                 "client_key_validation": bool(config.anthropic_api_key),
                 "pid": os.getpid(),

@@ -65,8 +65,9 @@ bash start.sh status
 | **Tor SOCKS5 #2** | `9060` | Proxy 2 — independent circuit |
 | **Tor Control** | `9051` | NEWNYM signal for IP rotation |
 | **Claude Proxy** | `4013` | Anthropic API → OpenAI API translation |
+| **Claude Dashboard** | `18081` | Read-only status dashboard (TLS + basic auth) |
 | **MiMo2Codex** | `8788` | `npm install -g mimo2codex` → OpenAI proxy for Codex CLI |
-| **Prime Agent** | — | `npm install -g prime-agent` → TUI agent wired to the mimo2codex proxy |
+| **Prime Agent** | — | TUI agent wired to the local proxies — `claude-code-proxy` (`:4013`) or `mimo2codex` (`:8788`) |
 | **IP Rotator** | — | Auto-rotates exit nodes every 10 min |
 
 ## Components Deep Dive
@@ -116,6 +117,10 @@ Translates Anthropic Claude API format to OpenAI-compatible format, pointing to 
 - `POST /v1/responses` — OpenAI Responses passthrough
 - `GET /health` — Health check
 
+**Consumers:** Claude Code CLI (via `ANTHROPIC_BASE_URL=http://127.0.0.1:4013`)
+and Prime Agent (via the `claude-code-proxy` provider — see
+[`prime-agent/`](prime-agent/)).
+
 **Config in** `.env`:
 ```bash
 OPENAI_BASE_URL=https://opencode.ai/zen/v1
@@ -138,6 +143,27 @@ Two more resilience knobs on the responses path:
 - Auto-compact fix — `function_call_output` items are emitted before
   any text in a message, since the provider rejects a message placed
   between a `function_call` and its output (this broke compaction).
+
+#### Transient-failure retry (all upstream paths)
+
+The free tier's models flap. The upstream answers with *"Model is
+temporarily unavailable upstream"*, a bare 5xx, a rate-limit rejection
+(`FreeUsageLimitError`), or drops the connection — and every one of those
+clears on its own within seconds. Clients can't retry them (they just
+show the error), so the proxy absorbs them:
+
+- `RETRY_ATTEMPTS` (default 10) — total attempts per request: 1 initial
+  try plus 9 retries.
+- `RETRY_INTERVAL_SECS` (default 10) — fixed wait between attempts. A
+  *fixed* interval, not exponential backoff: the free tier recovers on a
+  wall-clock window, so backing off would stretch the wait past the point
+  where the client has given up.
+
+Only transient failures are retried. A 400/401/403 is the request's or
+the credential's fault and is surfaced immediately rather than burning
+quota. While a retry waits, SSE keepalives go out so the client's stream
+watchdog doesn't time out on a silent connection. This applies to the
+`/v1/messages`, `/v1/responses` and `/v1/chat/completions` paths.
 
 ### 🎯 MiMo2Codex Proxy (Codex CLI)
 
@@ -166,15 +192,29 @@ mimo2codex --model generic
 
 ### 🚀 Prime Agent
 
-Terminal-first agent CLI (`prime-agent`) wired to the same `mimo2codex` proxy on port 8788 — no separate port.
+Terminal-first agent CLI (`prime-agent`) wired to the local translation proxies
+— no separate port. Two options:
+
+- **claude-code-proxy (`:4013`, recommended)** — registers the proxy as its
+  own Prime provider (`claude-code-proxy/claude-sonnet-4-5`,
+  `claude-code-proxy/claude-opus-4-6`, `claude-code-proxy/claude-haiku-4-5`)
+  so it shows up in `/model` and routes like Claude Code does
+  (sonnet→MIDDLE, opus→BIG, haiku→SMALL).
+- **mimo2codex (`:8788`)** — OpenAI-compatible provider
+  (`opencode/x-preview-f-free`).
 
 **Install:**
 ```bash
-npm install -g prime-agent
+curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh
 ```
 
-**Configure** `~/.prime/agent/models.json` + `~/.prime/agent/settings.json`:
+**Configure** `~/.prime/agent/models.json` (pick one template, or merge both
+provider blocks into the same file):
 ```bash
+# Option A — via the Claude proxy (:4013), shows up as claude-code-proxy/*
+cp prime-agent/models.claude-code-proxy.json.example ~/.prime/agent/models.json
+
+# Option B — via mimo2codex (:8788)
 cp prime-agent/models.json.example ~/.prime/agent/models.json
 cp prime-agent/settings.json.example ~/.prime/agent/settings.json
 export OPENAI_API_KEY=sk-you-api-key-here
@@ -182,7 +222,8 @@ export OPENAI_API_KEY=sk-you-api-key-here
 
 **Start:**
 ```bash
-prime-agent
+prime-agent                                     # Option B default: opencode/x-preview-f-free
+prime-agent --provider claude-code-proxy --model claude-sonnet-4-5   # Option A
 ```
 
 See [`prime-agent/README.md`](prime-agent/) for details.
@@ -285,6 +326,7 @@ tor-proxy-toolkit/
 │   ├── patch-user-agent.sh     # 429 fix (sends opencode UA upstream)
 │   └── README.md               # Setup instructions
 ├── prime-agent/                # Prime Agent CLI config
+│   ├── models.claude-code-proxy.json.example  # Claude proxy wiring (:4013)
 │   ├── models.json.example     # Provider + model catalog template
 │   ├── settings.json.example   # Global settings template
 │   └── README.md               # Setup instructions

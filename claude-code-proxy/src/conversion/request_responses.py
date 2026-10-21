@@ -126,7 +126,17 @@ def convert_claude_to_responses(
                     "parameters": caller_schemas[g["name"].lower()],
                 }
             gate_tools.append(g)
-        responses_request["tools"] = [*gate_tools, *responses_tools]
+        # Drop caller tools whose name is an EXACT duplicate of a manifest
+        # name: upstreams 400 the whole request on duplicate tool names
+        # (case-different names are accepted), and the manifest entry above
+        # already carries that caller's parameters. Without this, clients
+        # using lowercase builtins (OpenClaw, most OpenAI-style agents)
+        # collide with the lowercase manifest on every single turn.
+        manifest_names = {g.get("name", "") for g in GENUINE_CLI_TOOLS}
+        responses_request["tools"] = [
+            *gate_tools,
+            *[t for t in responses_tools if (t.get("name") or "") not in manifest_names],
+        ]
     else:
         # Tool-less turn: STILL declare the full genuine CLI manifest.
         # The free-tier gate (tightened ~2026-09-19) requires the tools

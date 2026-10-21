@@ -11,6 +11,7 @@ from fastapi import HTTPException
 from src.core.config import config
 from src.core.failure_log import record_upstream_failure
 from src.core.http_client import get_shared_client, get_stream_timeout
+from src.core.retry import sse_error_status
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +119,15 @@ class ResponsesClient:
         self.retry_budget_secs = retry_budget_secs
         self.active_requests: Dict[str, asyncio.Event] = {}
 
+    @property
+    def _retry_policy(self):
+        """Transient-failure retry policy (fixed interval, shared with the
+        chat path). The free tier's models flap; those failures clear in
+        seconds, so they are retried in place rather than surfaced. Read
+        from the config on every use so a policy change takes effect
+        without rebuilding the client."""
+        return config.retry_policy
+
     def _url(self) -> str:
         return f"{self.base_url}/responses"
 
@@ -172,31 +182,19 @@ class ResponsesClient:
             shape=ResponsesClient._payload_shape(payload),
         )
 
-    @staticmethod
-    def _retryable(exc: HTTPException) -> bool:
-        """Only server-side 5xx are worth retrying (never 4xx/499)."""
-        return exc.status_code is not None and exc.status_code >= 500
-
-    async def _backoff(self, attempt: int, deadline: float) -> bool:
-        """Sleep with exponential backoff; False when the budget is spent."""
-        import time
-
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return False
-        await asyncio.sleep(min(2**attempt, 30, remaining))
-        return True
-
     async def create_response(
         self, payload: Dict[str, Any], request_id: Optional[str] = None
     ) -> Dict[str, Any]:
-        """POST a Responses request and return the decoded JSON object."""
+        """POST a Responses request and return the decoded JSON object.
+
+        Transient upstream failures are retried in place on a fixed
+        interval (see :mod:`src.core.retry`) instead of being surfaced to
+        the client: the free tier's models flap and the next attempt
+        usually succeeds.
+        """
         if request_id:
             self.active_requests[request_id] = asyncio.Event()
         try:
-            import time
-
-            deadline = time.monotonic() + self.retry_budget_secs
             attempt = 0
             while True:
                 try:
@@ -225,16 +223,20 @@ class ResponsesClient:
                         )
                     break
                 except HTTPException as e:
-                    if self._retryable(e) and await self._backoff(attempt, deadline):
-                        attempt += 1
-                        logger.warning(
-                            "Upstream %s (model=%s), retrying in budget (attempt %d)",
-                            e.status_code,
-                            payload.get("model"),
-                            attempt,
-                        )
-                        continue
-                    raise
+                    attempt += 1
+                    if not self._retry_policy.should_retry(attempt, e):
+                        raise
+                    logger.warning(
+                        "Upstream %s (model=%s), transient — retrying in %ds "
+                        "(attempt %d/%d)",
+                        e.status_code,
+                        payload.get("model"),
+                        int(self._retry_policy.interval),
+                        attempt + 1,
+                        self._retry_policy.attempts,
+                    )
+                    await self._retry_policy.sleep()
+                    continue
             data = resp.json()
             if isinstance(data, dict) and data.get("type") == "error":
                 err_text = json.dumps(data)
@@ -292,9 +294,7 @@ class ResponsesClient:
         try:
             body = dict(payload)
             body["stream"] = True
-            import time
 
-            deadline = time.monotonic() + self.retry_budget_secs
             attempt = 0
             yielded_any = False
             while True:
@@ -350,30 +350,46 @@ class ResponsesClient:
                                     event_type, data = _parse_sse_event(text)
                                     if data is None:
                                         continue
+                                    # The upstream can answer HTTP 200 and
+                                    # then deliver the rejection inside the
+                                    # stream. Treat a transient one as a
+                                    # failed attempt so it is retried.
+                                    in_stream_status = sse_error_status(data)
+                                    if in_stream_status is not None:
+                                        raise HTTPException(
+                                            status_code=in_stream_status,
+                                            detail=classify_responses_error(data),
+                                        )
                                     yielded_any = True
                                     yield f"event: {event_type}\ndata: {data}"
                             tail = bytes(buf).decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
                             if tail.strip():
                                 event_type, data = _parse_sse_event(tail)
                                 if data is not None:
+                                    in_stream_status = sse_error_status(data)
+                                    if in_stream_status is not None:
+                                        raise HTTPException(
+                                            status_code=in_stream_status,
+                                            detail=classify_responses_error(data),
+                                        )
                                     yielded_any = True
                                     yield f"event: {event_type}\ndata: {data}"
                     break
                 except HTTPException as e:
                     # Retryable only before any bytes were yielded (safe:
                     # nothing sent downstream yet) and within budget.
-                    if (
-                        not yielded_any
-                        and self._retryable(e)
-                        and await self._backoff(attempt, deadline)
-                    ):
-                        attempt += 1
+                    attempt += 1
+                    if not yielded_any and self._retry_policy.should_retry(attempt, e):
                         logger.warning(
-                            "Upstream stream %s (model=%s), retrying in budget (attempt %d)",
+                            "Upstream stream %s (model=%s), transient — retrying "
+                            "in %ds (attempt %d/%d)",
                             e.status_code,
                             body.get("model"),
-                            attempt,
+                            int(self._retry_policy.interval),
+                            attempt + 1,
+                            self._retry_policy.attempts,
                         )
+                        await self._retry_policy.sleep()
                         continue
                     raise
         except HTTPException:

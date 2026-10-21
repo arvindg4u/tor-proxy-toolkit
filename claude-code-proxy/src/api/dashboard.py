@@ -429,6 +429,7 @@ function render(d){
     row('Models', modelNames.join(' / ') || '—', true) +
     row('Request timeout', fmtN(p.request_timeout) + 's') +
     row('Retry budget', fmtN(p.retry_budget_secs) + 's') +
+    row('Transient retry', fmtN(p.retry_attempts) + 'x every ' + fmtN(p.retry_interval_secs) + 's') +
     row('Keepalive', fmtN(p.keepalive_secs) + 's') +
     row('Process', 'pid ' + fmtN(p.pid) + ' · started ' + fmtDate(s.started_at)) +
     row('Cost (list estimate)', '$' + Number(s.total_cost_usd || 0).toFixed(2) + ' · not billed upstream') +
@@ -474,6 +475,7 @@ function render(d){
     row('Max output tokens', fmtN(p.max_tokens_limit)) +
     row('Request timeout', fmtN(p.request_timeout) + 's') +
     row('Retry budget', fmtN(p.retry_budget_secs) + 's') +
+    row('Transient retry', fmtN(p.retry_attempts) + 'x every ' + fmtN(p.retry_interval_secs) + 's') +
     row('SSE keepalive', fmtN(p.keepalive_secs) + 's') +
     row('Client key validation', p.client_key_validation ? 'enforced' : 'disabled');
   const f = d.last_upstream_failure;

@@ -13,15 +13,21 @@ from src.models.claude import ClaudeMessagesRequest
 def _parse_chat_item(item):
     """Normalize one upstream chat-stream item to ("chunk", dict | None).
 
-    Returns ("chunk", chunk_dict), ("done", None), or ("ignore", None).
+    Returns ("chunk", chunk_dict), ("done", None), ("ping", None), or
+    ("ignore", None).
     Phase 3 dict protocol: ``{"type": "chunk", "chunk": {...}}`` /
     ``{"type": "done"}`` (also accepts bare chunk dicts). Legacy
     pre-serialized ``"data: ..."`` strings still parse (backward compat).
+    A ``{"type": "ping"}`` item is a keepalive tick emitted by the client
+    while it waits out a transient upstream failure; it carries no payload
+    but keeps the client's stream watchdog from timing out.
     """
     if isinstance(item, dict):
         item_type = item.get("type")
         if item_type == "done":
             return ("done", None)
+        if item_type == "ping":
+            return ("ping", None)
         if item_type == "chunk":
             chunk = item.get("chunk")
             return ("chunk", chunk) if isinstance(chunk, dict) else ("ignore", None)
@@ -174,6 +180,11 @@ async def convert_openai_streaming_to_claude(
             kind, chunk = _parse_chat_item(item)
             if kind == "done":
                 break
+            if kind == "ping":
+                # Keepalive tick while the client waits out a transient
+                # upstream failure: no payload, just proof the stream lives.
+                yield f"event: {Constants.EVENT_PING}\ndata: {json.dumps({'type': Constants.EVENT_PING})}\n\n"
+                continue
             if kind != "chunk":
                 continue
             usage = chunk.get("usage", None)
@@ -356,6 +367,11 @@ async def convert_openai_streaming_to_claude_with_cancellation(
             kind, chunk = _parse_chat_item(item)
             if kind == "done":
                 break
+            if kind == "ping":
+                # Keepalive tick while the client waits out a transient
+                # upstream failure: no payload, just proof the stream lives.
+                yield f"event: {Constants.EVENT_PING}\ndata: {json.dumps({'type': Constants.EVENT_PING})}\n\n"
+                continue
             if kind != "chunk":
                 continue
             # logger.info(f"OpenAI chunk: {chunk}")
