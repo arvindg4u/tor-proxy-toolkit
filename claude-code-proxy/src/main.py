@@ -1,6 +1,7 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from src.api.endpoints import router as api_router
+import errno
 import uvicorn
 import sys
 from src.core.config import config
@@ -94,15 +95,28 @@ def main():
     if log_level not in valid_levels:
         log_level = 'info'
 
-    # Start server
-    uvicorn.run(
-        "src.main:app",
-        host=config.host,
-        port=config.port,
-        log_level=log_level,
-        reload=False,
-        **server_kwargs,
-    )
+    # Start server. A previous instance may still be releasing the port
+    # (e.g. an external stop racing a restart), so retry the bind for a
+    # while instead of exiting and leaving nginx to answer 502.
+    import time
+
+    for attempt in range(10):
+        try:
+            uvicorn.run(
+                "src.main:app",
+                host=config.host,
+                port=config.port,
+                log_level=log_level,
+                reload=False,
+                **server_kwargs,
+            )
+            break
+        except OSError as error:
+            if error.errno != errno.EADDRINUSE or attempt == 9:
+                raise
+            wait = 2
+            print(f"Port {config.port} still in use, retrying in {wait}s...", flush=True)
+            time.sleep(wait)
 
 
 if __name__ == "__main__":

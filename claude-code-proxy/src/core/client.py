@@ -7,9 +7,45 @@ from typing import Optional, AsyncGenerator, Dict, Any
 from openai import AsyncOpenAI, AsyncAzureOpenAI
 from openai.types.chat import ChatCompletion, ChatCompletionChunk
 from openai._exceptions import APIError, RateLimitError, AuthenticationError, BadRequestError
+from src.core.config import config
 from src.core.failure_log import record_upstream_failure
 
 logger = logging.getLogger(__name__)
+
+
+def _retry_policy():
+    """Transient-failure retry policy: the free tier's models flap, and the
+    upstream answers a flapping model with "Model is temporarily unavailable
+    upstream" or a dropped connection. Those clear within seconds, so they
+    are retried in place on a fixed interval rather than surfaced to the
+    client. See src/core/retry.py for the classification rules.
+
+    Read from the config on every use so a policy change takes effect
+    without restarting the proxy."""
+    return config.retry_policy
+
+
+def _sdk_http_client():
+    """HTTP client for the OpenAI SDK, using the Bun transport when possible.
+
+    The ZEN free tier fingerprints the TLS ClientHello, so the SDK's default
+    (OpenSSL) transport gets 403 FreeTierError. The Bun transport speaks the
+    same API but performs the request with Bun's TLS stack, which the gate
+    accepts. Falls back to the SDK default when bun is unavailable.
+    """
+    from src.core.bun_transport import get_bun_transport
+
+    transport = get_bun_transport()
+    if transport is None:
+        return None
+    try:
+        import httpx2
+
+        return httpx2.AsyncClient(transport=transport, timeout=httpx2.Timeout(180.0, read=None))
+    except ImportError:
+        import httpx
+
+        return httpx.AsyncClient(transport=transport, timeout=httpx.Timeout(180.0, read=None))
 
 # 429 local circuit breaker. The free tier's window is key-scoped: when it
 # is exhausted every upstream request answers 429 regardless of peer, and a
@@ -161,14 +197,16 @@ class OpenAIClient:
                 azure_endpoint=base_url,
                 api_version=api_version,
                 timeout=timeout,
-                default_headers=all_headers
+                default_headers=all_headers,
+                http_client=_sdk_http_client(),
             )
         else:
             self.client = AsyncOpenAI(
                 api_key=api_key,
                 base_url=base_url,
                 timeout=timeout,
-                default_headers=all_headers
+                default_headers=all_headers,
+                http_client=_sdk_http_client(),
             )
         self.active_requests: Dict[str, asyncio.Event] = {}
     
@@ -267,54 +305,91 @@ class OpenAIClient:
         Phase 3: yields decoded chunk dicts (``{"type": "chunk", "chunk": {...}}``,
         ``{"type": "done"}``) instead of pre-serialized ``"data: ..."`` strings,
         so the converter serializes exactly once at the SSE boundary.
+
+        Transient upstream failures ("Model is temporarily unavailable", a
+        dropped connection, a 5xx) are retried in place on a fixed interval
+        instead of being surfaced to the client — the free tier's models flap
+        and the next attempt usually succeeds. While waiting, a keepalive
+        tick is yielded so the client's stream watchdog does not time out.
         """
         _rate_guard_check()
-        
+
         # Create cancellation token if request_id provided
         if request_id:
             cancel_event = asyncio.Event()
             self.active_requests[request_id] = cancel_event
-        
+
         try:
             # Ensure stream is enabled
             request["stream"] = True
             if "stream_options" not in request:
                 request["stream_options"] = {}
             request["stream_options"]["include_usage"] = True
-            
-            # Create the streaming completion. The opencode gate answers a
-            # flagged egress IP with 403 (IP-abuse FreeTierError) at connect
-            # time — nothing is yielded yet, so wait for auto.sh's rotation
-            # and retry once here, fully transparent to the client.
-            try:
-                streaming_completion = await self.client.chat.completions.create(**request)
-                _rate_guard_reset()
-            except APIError as e:
-                if not _rotate_retried and await _recover_ip_abuse_403(e):
-                    streaming_completion = await self.client.chat.completions.create(**request)
-                elif (
-                    not _rotate_retried
-                    and getattr(e, "status_code", None) == 429
-                    and not _is_key_scoped_429(str(e))
-                ):
-                    # Log first: auto.sh watches this line and owns rotation.
-                    logger.error(f"chat stream 429: {str(e)[:220]}")
-                    logger.warning(
-                        "transient 429; waiting for auto.sh rotation before one retry"
+
+            # Open the upstream stream, retrying transient failures in place.
+            #
+            # The upstream answers a flapping free-tier model with "Model is
+            # temporarily unavailable upstream", a bare 5xx, or a dropped
+            # connection. Those clear on their own within seconds, so the
+            # stream is re-opened on a fixed interval (10 attempts, 10s
+            # apart) instead of failing the client's turn. A keepalive tick
+            # is yielded during each wait so the client's stream watchdog
+            # does not give up on a silent connection.
+            attempt = 0
+            while True:
+                try:
+                    streaming_completion = (
+                        await self.client.chat.completions.create(**request)
                     )
-                    if await _await_peer_rotation(max_wait=30.0):
-                        streaming_completion = await self.client.chat.completions.create(**request)
-                    else:
-                        raise
-                else:
+                    _rate_guard_reset()
+                    break
+                except AuthenticationError:
                     raise
-            
+                except BadRequestError:
+                    raise
+                except APIError as e:
+                    # The opencode gate answers a flagged egress IP with 403
+                    # (IP-abuse FreeTierError) at connect time. That one is
+                    # cured by a fresh peer, so wait for auto.sh's rotation
+                    # and retry once here, fully transparent to the client.
+                    if not _rotate_retried and await _recover_ip_abuse_403(e):
+                        _rotate_retried = True
+                        continue
+                    if (
+                        not _rotate_retried
+                        and getattr(e, "status_code", None) == 429
+                        and not _is_key_scoped_429(str(e))
+                    ):
+                        # Log first: auto.sh watches this line and owns rotation.
+                        logger.error(f"chat stream 429: {str(e)[:220]}")
+                        logger.warning(
+                            "transient 429; waiting for auto.sh rotation before one retry"
+                        )
+                        if await _await_peer_rotation(max_wait=30.0):
+                            _rotate_retried = True
+                            continue
+                    attempt += 1
+                    policy = _retry_policy()
+                    if not policy.should_retry(attempt, e):
+                        raise
+                    # Log in the shape auto.sh watches so the egress peer is
+                    # rotated while we wait.
+                    logger.error(f"chat stream upstream transient: {str(e)[:220]}")
+                    logger.warning(
+                        "transient upstream failure, retrying in %ds (attempt %d/%d)",
+                        int(policy.interval),
+                        attempt + 1,
+                        policy.attempts,
+                    )
+                    yield {"type": "ping"}
+                    await policy.sleep()
+
             async for chunk in streaming_completion:
                 # Check for cancellation before yielding each chunk
                 if request_id and request_id in self.active_requests:
                     if self.active_requests[request_id].is_set():
                         raise HTTPException(status_code=499, detail="Request cancelled by client")
-                
+
                 # Convert chunk to a decoded dict (no JSON round-trip here;
                 # the converter serializes once at the SSE boundary).
                 chunk_dict = chunk.model_dump()
@@ -322,7 +397,7 @@ class OpenAIClient:
 
             # Signal end of stream
             yield {"type": "done"}
-                
+
         except AuthenticationError as e:
             logger.error(f"chat stream 401: {str(e)[:220]}")
             self._record_failure(401, e, request, request_id)
@@ -349,7 +424,7 @@ class OpenAIClient:
             logger.error(f"chat stream unexpected: {str(e)[:220]}")
             self._record_failure(500, e, request, request_id)
             raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
-        
+
         finally:
             # Clean up active request tracking
             if request_id and request_id in self.active_requests:

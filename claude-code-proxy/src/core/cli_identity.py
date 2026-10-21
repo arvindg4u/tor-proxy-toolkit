@@ -8,6 +8,12 @@ OpenCode CLI. The gateway ("Console") rejects anything else with::
 
 The gate requires, on every Responses request:
 
+0. a client whose TLS ClientHello looks like the OpenCode CLI's. The gate
+   fingerprints the TLS handshake: the exact same request, byte for byte,
+   is accepted with Bun's BoringSSL stack (what the CLI uses) and rejected
+   with 403 FreeTierError when sent by Python's httpx/OpenSSL. This is why
+   the upstream calls go through the Bun transport in
+   ``src/core/bun_transport.py`` and never through httpx directly.
 1. stream: true in the request body (non-streaming bodies are rejected
    even when everything else matches),
 2. a tools array declaring the genuine CLI tool functions — including
@@ -22,6 +28,15 @@ The gate requires, on every Responses request:
    reusable and do not expire -- set one via OPENCODE_SESSION_ID),
 4. User-Agent: opencode/<cli-version> (>= 1.17.0),
 5. x-opencode-client: cli, plus a msg_-formatted x-opencode-request id.
+
+Session-id format is checked strictly: the same request body and every
+other header returns 200 with a well-formed id and 403 FreeTierError with
+one whose 12-char head is not lowercase hex, whose suffix is not exactly
+14 alphanumerics, or which is longer/shorter overall (verified live
+2026-10-21 by replaying one captured CLI request with only the id
+changed). ``config._coerce_session_id`` therefore validates the
+configured id and falls back to .env / a freshly minted CLI-shaped id --
+an inherited shell export must never wedge the proxy into 403s.
 
 Notably NOT required: a logged-in account, fresh/unique ids, or
 tunneling (the same 403 reproduces on a direct connection).
@@ -116,6 +131,16 @@ def chat_format_gate_tools(caller_tools, enabled: bool = True) -> List[Dict[str,
     emits. The manifest entry keeps its name + description (gate-visible).
     Tool-less turns get the full manifest alone. Never mutates inputs.
 
+    Caller tools whose name is an **exact** duplicate of a manifest name are
+    dropped instead of appended. The upstream rejects the entire request
+    with 400 when two tools share an identical name (case-different names
+    are accepted), and the manifest entry already carries the caller's
+    parameters, so the dropped copy is redundant. Clients that use
+    lowercase builtin names (OpenClaw and most OpenAI-style agents: ``bash``,
+    ``read``, ``edit``, ...) collide with the lowercase manifest and would
+    otherwise fail every turn; Claude Code's PascalCase names (``Bash``,
+    ``Read``) do not collide and are still appended unchanged.
+
     ``enabled=False`` (non-OpenCode upstream) passes caller tools through
     unchanged.
     """
@@ -128,10 +153,15 @@ def chat_format_gate_tools(caller_tools, enabled: bool = True) -> List[Dict[str,
         tname = (fn.get("name") or "").lower()
         if tname and tname not in caller_schemas:
             caller_schemas[tname] = fn.get("parameters") or {}
+    manifest = _chat_cli_manifest()
+    manifest_names = {g["function"].get("name") or "" for g in manifest}
     gate_tools: List[Dict[str, Any]] = []
-    for g in _chat_cli_manifest():
+    for g in manifest:
         tname = (g["function"].get("name") or "").lower()
         if tname in caller_schemas:
             g = {**g, "function": {**g["function"], "parameters": caller_schemas[tname]}}
         gate_tools.append(g)
-    return [*gate_tools, *caller]
+    extras = [
+        t for t in caller if (t.get("function") or {}).get("name") not in manifest_names
+    ]
+    return [*gate_tools, *extras]

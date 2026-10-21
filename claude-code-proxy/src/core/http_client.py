@@ -57,7 +57,11 @@ def get_stream_timeout() -> httpx.Timeout:
 
 
 async def get_shared_client() -> httpx.AsyncClient:
-    """Return the process-wide shared AsyncClient (created on first use)."""
+    """Return the process-wide shared AsyncClient (created on first use).
+
+    Uses the Bun transport when available: the upstream free tier fingerprints
+    the TLS ClientHello and rejects OpenSSL clients with 403 FreeTierError.
+    """
     global _shared_client
     with _client_guard:
         if _shared_client is not None and not _shared_client.is_closed:
@@ -67,10 +71,22 @@ async def get_shared_client() -> httpx.AsyncClient:
             max_keepalive_connections=20,
             keepalive_expiry=30.0,
         )
+        transport = None
+        try:
+            from src.core.bun_transport import get_bun_transport
+
+            # This client is a plain httpx.AsyncClient, so the transport
+            # must be the httpx flavour. Handing it the httpx2 one makes
+            # every streaming call fail on httpx's own
+            # `isinstance(response.stream, AsyncByteStream)` assertion.
+            transport = get_bun_transport(flavour="httpx")
+        except Exception:
+            transport = None
         _shared_client = httpx.AsyncClient(
             timeout=_request_timeout_secs(),
             limits=limits,
             http2=_http2_supported(),
+            transport=transport,
         )
         return _shared_client
 

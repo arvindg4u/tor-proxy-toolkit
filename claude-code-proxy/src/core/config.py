@@ -1,19 +1,81 @@
 import logging
 import os
+import re
 import sys
 
 from src.core.cli_identity import new_message_id
+from src.core.retry import RetryPolicy, retry_settings
 
 logger = logging.getLogger(__name__)
 
+# OpenCode CLI session id shape: "ses_" + 12 lowercase hex chars + 14
+# alphanumerics (30 chars total). ZEN's free-tier gate rejects anything else
+# with FreeTierError ("free tier can only be used from within OpenCode") --
+# verified live: the exact same request body/headers returns 200 with a
+# well-formed id and 403 with a malformed one.
+SESSION_ID_RE = re.compile(r"^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$")
+
+# OpenCode project id shape: 40 lowercase hex chars (sha1 sized), the same
+# shape the real CLI sends in x-opencode-project.
+PROJECT_ID_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _new_trace_ids() -> tuple[str, str]:
+    """W3C trace id (32 hex) and span id (16 hex) for trace propagation."""
+    import secrets
+
+    return secrets.token_hex(16), secrets.token_hex(8)
+
+
 
 def _new_session_id():
-    """Generate an OpenCode-style session id (ses_ + 24 alphanumerics)."""
+    """Generate a CLI-shaped OpenCode session id.
+
+    Shape: ``ses_`` + 12 lowercase hex chars + 14 mixed-case alphanumerics.
+    The old generator emitted 24 arbitrary alphanumerics, which the ZEN
+    free-tier gate rejects (the 12-hex part must be lowercase hex).
+    """
     import secrets
     import string
 
-    alphabet = string.ascii_letters + string.digits
-    return "ses_" + "".join(secrets.choice(alphabet) for _ in range(24))
+    hex_alphabet = "0123456789abcdef"
+    alnum_alphabet = string.ascii_letters + string.digits
+    prefix = "".join(secrets.choice(hex_alphabet) for _ in range(12))
+    suffix = "".join(secrets.choice(alnum_alphabet) for _ in range(14))
+    return f"ses_{prefix}{suffix}"
+
+
+def _coerce_session_id(raw):
+    """Return a gate-valid session id for ``raw`` (or a freshly minted one).
+
+    An inherited environment variable (e.g. exported in the shell that
+    started the proxy) beats .env, so a malformed OPENCODE_SESSION_ID can
+    wedge the proxy into permanent 403s. Never trust it blindly: fall back
+    to a valid .env value, then to a freshly minted id.
+    """
+    candidate = (raw or "").strip()
+    if candidate and SESSION_ID_RE.match(candidate):
+        return candidate
+    if candidate:
+        logger.warning(
+            "OPENCODE_SESSION_ID %r does not match the CLI session id format "
+            "(ses_ + 12 lowercase hex + 14 alphanumerics); ZEN's free-tier "
+            "gate would reject it with 403 FreeTierError -- falling back",
+            candidate,
+        )
+    # .env value (if any) is the next best source: it is the operator's
+    # pinned, known-good CLI id.
+    try:
+        from dotenv import dotenv_values
+
+        env_value = (dotenv_values().get("OPENCODE_SESSION_ID") or "").strip()
+        if env_value and SESSION_ID_RE.match(env_value):
+            logger.warning("using the .env OPENCODE_SESSION_ID instead")
+            return env_value
+    except Exception:  # pragma: no cover - dotenv missing/unreadable
+        pass
+    logger.warning("minting a fresh CLI-shaped session id")
+    return _new_session_id()
 
 
 # Configuration
@@ -72,8 +134,16 @@ class Config:
         # The server only checks presence/format (it cannot know local
         # session ids in advance), so an auto-generated stable id per proxy
         # start works. Pin via OPENCODE_SESSION_ID to reuse one.
-        self.opencode_session_id = os.environ.get("OPENCODE_SESSION_ID") or _new_session_id()
+        self.opencode_session_id = _coerce_session_id(os.environ.get("OPENCODE_SESSION_ID"))
         self.opencode_project_id = os.environ.get("OPENCODE_PROJECT_ID", "global")
+        if not PROJECT_ID_RE.match(self.opencode_project_id or ""):
+            # The real CLI sends a 40 hex char project id; the gate expects
+            # that shape, so derive a stable one from whatever is configured.
+            import hashlib
+
+            self.opencode_project_id = hashlib.sha1(
+                (self.opencode_project_id or "global").encode()
+            ).hexdigest()
         self.opencode_client = os.environ.get("OPENCODE_CLIENT", "cli")
         self.opencode_user_id = os.environ.get("OPENCODE_USER_ID", "")
 
@@ -86,6 +156,16 @@ class Config:
         # Muse Spark free tier flaps; the CLI retries too, but absorbing
         # short outages here avoids CLI-visible errors entirely.
         self.responses_retry_budget_secs = float(os.environ.get("RESPONSES_RETRY_BUDGET_SECS", "120"))
+
+        # Transient-failure retry policy shared by every upstream path.
+        # The free tier's models flap ("Model is temporarily unavailable
+        # upstream", bare 5xx, dropped connections); those failures clear on
+        # their own within seconds, so the proxy retries them in place
+        # instead of surfacing an error to the client. A FIXED interval
+        # (not exponential backoff) matches how long the client is willing
+        # to wait, and the count caps the total wait.
+        self.retry_attempts, self.retry_interval_secs = retry_settings()
+        self.retry_policy = RetryPolicy(self.retry_attempts, self.retry_interval_secs)
 
         # SSE keepalive interval (seconds) on the responses streaming path.
         # Reasoning upstreams can go silent for minutes; Claude Code shows
@@ -104,14 +184,14 @@ class Config:
             print(f"Warning: unknown CACHE_TTL_DEFAULT '{self.cache_ttl_default}', falling back to '5m'.")
             self.cache_ttl_default = "5m"
 
-    def _fresh_opencode_ua(self, pinned: str = "opencode/1.19.3", ttl_secs: int = 86400) -> str:
-        """Latest ``opencode/<version>`` UA, cached ~daily, falls back to pinned.
+    def _fresh_opencode_ua(self, pinned: str = "opencode/latest/1.19.3/cli", ttl_secs: int = 86400) -> str:
+        """Latest ``opencode/latest/<version>/cli`` UA, cached ~daily.
 
-        ``User-Agent: opencode/<version>`` is one of the free-tier gate checks;
-        a stale version starts 403ing once the CLI moves on. Querying npm keeps
-        the pin current without manual updates. Never raises: any failure
-        (offline, timeout, parse) falls back to the last cached value, then the
-        pinned default.
+        This is the exact User-Agent shape the real OpenCode CLI sends
+        (captured from a live CLI request). The version comes from the
+        locally installed CLI when available, otherwise from the npm
+        registry. Never raises: any failure (offline, timeout, parse) falls
+        back to the last cached value, then the pinned default.
         """
         import json as _json
         from pathlib import Path
@@ -121,28 +201,30 @@ class Config:
             import time as _time
             if cache.exists() and (_time.time() - cache.stat().st_mtime) < ttl_secs:
                 cached = cache.read_text().strip()
-                if cached:
+                if cached.startswith("opencode/latest/"):
                     return cached
         except OSError:
             pass
-        try:
-            import httpx
-            r = httpx.get(
-                "https://registry.npmjs.org/opencode-ai/latest",
-                timeout=3.0,
-                headers={"User-Agent": "claude-code-proxy/version-probe"},
-            )
-            ver = str(_json.loads(r.text)["version"]).strip()
-            if ver:
-                ua = f"opencode/{ver}"
-                try:
-                    cache.parent.mkdir(parents=True, exist_ok=True)
-                    cache.write_text(ua)
-                except OSError:
-                    pass
-                return ua
-        except Exception as e:
-            logger.debug(f"opencode version probe failed: {e}")
+        version = self._local_opencode_version()
+        if not version:
+            try:
+                import httpx
+                r = httpx.get(
+                    "https://registry.npmjs.org/opencode-ai/latest",
+                    timeout=3.0,
+                    headers={"User-Agent": "claude-code-proxy/version-probe"},
+                )
+                version = str(_json.loads(r.text)["version"]).strip()
+            except Exception as e:
+                logger.debug(f"opencode version probe failed: {e}")
+        if version:
+            ua = f"opencode/latest/{version}/cli"
+            try:
+                cache.parent.mkdir(parents=True, exist_ok=True)
+                cache.write_text(ua)
+            except OSError:
+                pass
+            return ua
         # Serve stale cache if fresh fetch failed but an old one exists.
         try:
             cached = cache.read_text().strip()
@@ -151,6 +233,26 @@ class Config:
         except OSError:
             pass
         return pinned
+
+    @staticmethod
+    def _local_opencode_version() -> str:
+        """Version of the locally installed OpenCode CLI, if any."""
+        import re
+        import shutil
+        import subprocess
+
+        binary = shutil.which("opencode") or "/home/ubuntu/.opencode/bin/opencode"
+        try:
+            out = subprocess.run(
+                [binary, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            ).stdout
+        except Exception:
+            return ""
+        match = re.search(r"v?(\d+\.\d+\.\d+)", out)
+        return match.group(1) if match else ""
 
         
     def validate_api_key(self):
@@ -201,10 +303,19 @@ class Config:
         the free-tier gate expects the header present in CLI (``msg_``)
         format. The session id stays pinned (set OPENCODE_SESSION_ID to a
         genuine CLI-generated ``ses_`` id -- values are reusable).
+
+        The header set below mirrors what the real OpenCode CLI sends
+        (captured from a live CLI request): the gate rejects requests that
+        omit the ``x-opencode-*`` family, the session affinity headers or the
+        trace propagation headers, answering 403 FreeTierError.
         """
         headers = {"User-Agent": self.upstream_user_agent}
-        if self.opencode_session_id:
-            headers["x-opencode-session"] = self.opencode_session_id
+        session_id = self.opencode_session_id
+        if session_id:
+            headers["x-opencode-session"] = session_id
+            headers["x-opencode-session-id"] = session_id
+            headers["x-session-affinity"] = session_id
+            headers["x-session-id"] = session_id
         if self.opencode_project_id:
             headers["x-opencode-project"] = self.opencode_project_id
         if self.opencode_client:
@@ -212,6 +323,9 @@ class Config:
         headers["x-opencode-request"] = (
             self.opencode_user_id or new_message_id()
         )
+        trace_id, span_id = _new_trace_ids()
+        headers["traceparent"] = f"00-{trace_id}-{span_id}-01"
+        headers["b3"] = f"{trace_id}-{span_id}-1-{trace_id}"
         return headers
 
 try:

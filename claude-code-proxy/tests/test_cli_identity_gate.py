@@ -165,6 +165,57 @@ def test_manifest_duplicates_carry_caller_schema():
     assert before == after
 
 
+def test_exact_duplicate_caller_tool_dropped():
+    # Clients that name their builtins in lowercase (OpenClaw, most
+    # OpenAI-style agents) collide exactly with the lowercase manifest.
+    # Upstreams 400 the whole request on duplicate tool names (verified
+    # live: `Bash` alongside manifest `bash` passes, `bash` fails), so the
+    # duplicate must be dropped -- the manifest entry already carries the
+    # caller's parameters.
+    caller_schema = {
+        "type": "object",
+        "properties": {"command": {"type": "string"}},
+    }
+    req = _claude_req(
+        tools=[
+            {"name": "bash", "description": "run", "input_schema": caller_schema},
+            {"name": "read", "description": "read", "input_schema": caller_schema},
+            {"name": "my_probe", "description": "probe", "input_schema": caller_schema},
+        ]
+    )
+    out = convert_claude_to_responses(req, model_manager)
+    names = [t["name"] for t in out["tools"]]
+    # No exact duplicates anywhere in the array.
+    assert len(names) == len(set(names)), names
+    # Every manifest name still present exactly once (gate requirement).
+    assert names[: len(GENUINE_CLI_TOOLS)] == [t["name"] for t in GENUINE_CLI_TOOLS]
+    # Only the non-colliding caller tool is appended.
+    assert len(out["tools"]) == len(GENUINE_CLI_TOOLS) + 1
+    assert names[-1] == "my_probe"
+    # The colliding manifest entries speak the caller's schema.
+    by_name = {t["name"]: t for t in out["tools"]}
+    assert "command" in by_name["bash"]["parameters"]["properties"]
+
+
+def test_case_different_caller_tool_appends():
+    # Case-different names are NOT duplicates upstream, so Claude Code's
+    # PascalCase builtins still get their own entry (response path renames
+    # them back), preserving existing behaviour.
+    req = _claude_req(
+        tools=[
+            {
+                "name": "Bash",
+                "description": "run",
+                "input_schema": {"type": "object", "properties": {}},
+            }
+        ]
+    )
+    out = convert_claude_to_responses(req, model_manager)
+    names = [t["name"] for t in out["tools"]]
+    assert "bash" in names and "Bash" in names
+    assert len(out["tools"]) == len(GENUINE_CLI_TOOLS) + 1
+
+
 def test_non_overlapping_caller_appends():
     req = _claude_req(
         tools=[
@@ -194,7 +245,8 @@ def test_upstream_headers_msg_id():
         # Version must be current-ish (the gate enforces CLI freshness):
         # any opencode/semver UA is acceptable here; the exact min version
         # moves with each release, so assert the format, not the pin.
-        assert re.fullmatch(r"opencode/\d+\.\d+\.\d+", h["User-Agent"]), h
+        # The real CLI sends "opencode/latest/<version>/cli".
+        assert re.fullmatch(r"opencode/latest/\d+\.\d+\.\d+/cli", h["User-Agent"]), h
     # Fresh id minted on every call.
     assert h1["x-opencode-request"] != h2["x-opencode-request"]
     assert re.fullmatch(r"msg_[A-Za-z0-9]{26}", new_message_id())

@@ -35,7 +35,7 @@ fi
 TOR_SOCKS_PORT1="${TOR_SOCKS_PORT1:-9050}"
 TOR_SOCKS_PORT2="${TOR_SOCKS_PORT2:-9060}"
 TOR_CONTROL_PORT="${TOR_CONTROL_PORT:-9051}"
-TOR_CONTROL_PASSWORD="${TOR_…ord:-chintu_tor_2026}"
+TOR_CONTROL_PASSWORD="${TOR_CONTROL_PASSWORD:-chintu_tor_2026}"
 CLAUDE_PROXY_PORT="${CLAUDE_PROXY_PORT:-4013}"
 MIMO_PROXY_PORT="${MIMO_PROXY_PORT:-8788}"
 ROTATE_INTERVAL="${ROTATE_INTERVAL:-600}"
@@ -114,6 +114,11 @@ start_claude_proxy() {
     export UPSTREAM_USER_AGENT="${UPSTREAM_USER_AGENT:-opencode/1.18.29}"
     export RESPONSES_MIN_OUTPUT_TOKENS="${RESPONSES_MIN_OUTPUT_TOKENS:-2048}"
     export RESPONSES_RETRY_BUDGET_SECS="${RESPONSES_RETRY_BUDGET_SECS:-120}"
+    # Transient-failure retry policy: the free tier's models flap, so a
+    # transient upstream failure is retried in place (fixed interval) rather
+    # than surfaced to the client.
+    export RETRY_ATTEMPTS="${RETRY_ATTEMPTS:-10}"
+    export RETRY_INTERVAL_SECS="${RETRY_INTERVAL_SECS:-10}"
     export OPENCODE_SESSION_ID="${OPENCODE_SESSION_ID:-}"
     export OPENCODE_PROJECT_ID="${OPENCODE_PROJECT_ID:-global}"
     export OPENCODE_CLIENT="${OPENCODE_CLIENT:-cli}"
@@ -123,7 +128,15 @@ start_claude_proxy() {
     export LOG_LEVEL="WARNING"
     export MAX_TOKENS_LIMIT="128000"
 
-    python3 start_proxy.py > "$LOG_DIR/claude-proxy.log" 2>&1 &
+    # Upstream calls go through the local gluetun/Proton VPN proxy (loopback only).
+    # Set explicitly so an inherited proxy from the calling shell can't override it.
+    export HTTPS_PROXY="http://127.0.0.1:8888"
+    export HTTP_PROXY="http://127.0.0.1:8888"
+    export NO_PROXY="localhost,127.0.0.1,::1"
+
+    local py="python3"
+    [ -x "$SCRIPT_DIR/claude-code-proxy/.venv/bin/python" ] && py="$SCRIPT_DIR/claude-code-proxy/.venv/bin/python"
+    "$py" start_proxy.py > "$LOG_DIR/claude-proxy.log" 2>&1 &
     echo $! > "$PID_DIR/claude-proxy.pid"
     sleep 2
     if kill -0 "$(cat $PID_DIR/claude-proxy.pid)" 2>/dev/null; then
