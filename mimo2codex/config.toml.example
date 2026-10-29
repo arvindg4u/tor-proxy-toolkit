@@ -7,7 +7,6 @@ model = "muse-spark-1.3-contributor-free"
 model_provider = "zen-proxy"
 model_reasoning_effort = "xhigh"
 model_context_window = 1000000
-model_max_output = 128000
 service_tier = "default"
 
 # Model metadata catalog so Codex trusts the context window and reasoning
@@ -44,16 +43,22 @@ prevent_idle_sleep = true
 network_proxy = true
 multi_agent = true
 
-[profiles.strict]
-approval_policy = "on-request"
-sandbox_mode = "read-only"
-web_search = "cached"
-
-[profiles.yolo]
-approval_policy = "never"
-sandbox_mode = "workspace-write"
-web_search = "live"
-
 [agents]
 max_threads = 6
 max_depth = 1
+
+# ---------------------------------------------------------------------------
+# Profiles
+# ---------------------------------------------------------------------------
+# Codex 0.165 removed inline `[profiles.<name>]` tables: a config containing one
+# makes `-p <name>` fail with "cannot be used while ... contains legacy
+# [profiles.strict] config". Profiles must now live in their own layer file at
+# $CODEX_HOME/<name>.config.toml. Copy the examples alongside this config:
+#
+#   cp mimo2codex/strict.config.toml.example ~/.codex/strict.config.toml
+#   cp mimo2codex/yolo.config.toml.example   ~/.codex/yolo.config.toml
+#
+# then select one per run:
+#
+#   codex exec -p strict "review this diff"
+#   codex exec -p yolo   "fix the failing tests"

@@ -36,16 +36,17 @@ prevent_idle_sleep = true
 network_proxy = true
 multi_agent = true
 
-[profiles.strict]
-approval_policy = "on-request"
-sandbox_mode = "read-only"
-web_search = "cached"
-
-[profiles.yolo]
-approval_policy = "never"
-sandbox_mode = "workspace-write"
-web_search = "live"
-
 [agents]
 max_threads = 6
 max_depth = 1
+
+# ---------------------------------------------------------------------------
+# Profiles
+# ---------------------------------------------------------------------------
+# Codex 0.165 removed inline `[profiles.<name>]` tables — `-p <name>` now fails
+# with "cannot be used while ... contains legacy [profiles.strict] config".
+# Profiles live in their own layer file at $CODEX_HOME/<name>.config.toml.
+# Copy the examples alongside this config:
+#
+#   cp mimo2codex/strict.config.toml.example ~/.codex/strict.config.toml
+#   cp mimo2codex/yolo.config.toml.example   ~/.codex/yolo.config.toml

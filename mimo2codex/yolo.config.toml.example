@@ -1,0 +1,6 @@
+# Codex CLI config layer — full-access profile.
+# Copy to ~/.codex/yolo.config.toml, then: codex exec -p yolo "..."
+
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+web_search = "live"

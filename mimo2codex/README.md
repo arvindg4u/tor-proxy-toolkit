@@ -82,6 +82,32 @@ cp mimo2codex/catalog.kilo.json ~/.codex/catalog.json
 Verify with `codex debug models`, then run Codex — requests flow
 Codex → `:8788` → Kilo gateway → model.
 
+## Codex CLI version compatibility
+
+These configs are validated against **Codex 0.165.0**. Two breaking changes in
+this version are easy to miss, because Codex only *warns* about an unknown key
+rather than failing — so a stale config degrades quietly instead of erroring:
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `warning: ... "model_max_output" is ignored` on every run | Key was removed | Delete the line. Use `model_context_window` only. |
+| `-p strict` fails: *"cannot be used while config.toml contains legacy `[profiles.strict]` config"* | Inline `[profiles.<name>]` tables are legacy | Move each profile into its own `$CODEX_HOME/<name>.config.toml` layer file (see `strict.config.toml.example`, `yolo.config.toml.example`) |
+
+Also worth knowing: **`wire_api = "chat"` was removed from Codex in Feb 2026.**
+All providers must use `wire_api = "responses"`. This does not conflict with the
+Kilo block using `GENERIC_WIRE_API=chat` — that setting describes the *upstream*
+(Kilo) protocol, and mimo2codex translates Codex's Responses requests down to
+`/chat/completions` (`dist/translate/reqToChat.js`).
+
+Run the checker before trusting these examples against a newer Codex:
+
+```bash
+bash mimo2codex/validate-config.sh
+```
+
+It loads each example under `--strict-config` (which promotes those warnings to
+errors) and exercises `-p strict`. Use it after every Codex upgrade.
+
 ## Codex CLI Integration
 
 Add to `~/.codex/config.toml`:

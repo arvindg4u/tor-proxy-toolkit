@@ -1,0 +1,6 @@
+# Codex CLI config layer — read-only profile.
+# Copy to ~/.codex/strict.config.toml, then: codex exec -p strict "..."
+
+approval_policy = "on-request"
+sandbox_mode = "read-only"
+web_search = "cached"
